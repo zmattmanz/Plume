@@ -226,7 +226,9 @@ static unsigned long last_buzzer_time = 0;
 static NimBLEScan* pBLEScan;
 static uint32_t ble_scan_cycle = 0;
 static volatile uint32_t ambient_packet_count = 0;
-#define BLE_MAX_CONCURRENT_TASKS 6
+// NOTE: Reserved — was used by an earlier dynamic-spawn BLE worker design that
+// has since been replaced with a single persistent worker task. Safe to delete.
+#define BLE_MAX_CONCURRENT_TASKS 6  // unused
 QueueHandle_t ble_event_queue;
 bool sd_available = false;
 bool littlefs_available = false;
@@ -347,7 +349,7 @@ int  last_cap_rssi           = 0;
 int  last_cap_confidence     = 0;
 char last_cap_time[9]        = "00:00:00";
 char last_cap_det_method[64] = "";
-int  last_cap_seq_num        = -1;
+int  last_cap_seq_num        = -1;  // written in log_detection, currently unread; reserved for sequence-anomaly UI
 
 #define CAPTURE_HISTORY_SIZE 5
 struct CaptureEntry {
@@ -862,6 +864,9 @@ const char* confidence_label(int score) {
     return "LOW";
 }
 
+// NOTE: Currently unused but reserved — invoke when adding a confidence-tinted
+// chip on the detection detail card. Safe to delete if unused after v9.5.
+__attribute__((unused))
 uint16_t confidence_color(int score) {
     if (score >= CONFIDENCE_CERTAIN) return ACCENT_COLOR;
     if (score >= CONFIDENCE_HIGH)    return CAUTION_COLOR;
@@ -1644,14 +1649,19 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
 
     if (is_new) {
         add_seen_mac(mac);
+        bool is_sim = (strcmp(type, "SIMULATION") == 0);
+
         if (strcmp(proto, "WIFI") == 0) {
-            session_wifi++; lifetime_wifi++; session_flock_wifi++; blip_col = CAUTION_COLOR;
+            session_wifi++; lifetime_wifi++;
+            if (!is_sim) session_flock_wifi++;
+            blip_col = CAUTION_COLOR;
         } else {
-            session_ble++; lifetime_ble++; blip_col = PURPLE_COLOR;
+            session_ble++; lifetime_ble++;
+            blip_col = PURPLE_COLOR;
         }
         if (strstr(type, "RAVEN") != NULL) { session_raven++; blip_col = TEAL_COLOR; }
-        else if (strcmp(proto, "BLE") == 0) { session_flock_ble++; }
-        lifetime_flock_total++;
+        else if (strcmp(proto, "BLE") == 0 && !is_sim) { session_flock_ble++; }
+        if (!is_sim) lifetime_flock_total++;
         add_to_capture_history(type, mac, name, rssi, confidence);
         trigger_toast(type, name, confidence);
         // Flash LED: yellow for WiFi, purple for BLE
@@ -2704,10 +2714,11 @@ void draw_toast_spr() {
             toast_accent_color = toast_queue[toast_queue_head].accent;
             toast_start = millis();
             toast_active = true;
+            elapsed = 0;  // recalibrate for the new toast — fall through to render it now
         } else {
             toast_active = false;
+            return;
         }
-        return;
     }
 
     int y_pos = DISP_H - 34;
@@ -3285,6 +3296,9 @@ void draw_scanner_screen() {
 }
 
 // FNV-1a 32-bit hash of MAC address → 6 uppercase hex chars (deterministic, no storage)
+// NOTE: Currently unused but reserved for future "named target" UI on locator screen.
+// Safe to delete if still unused after v9.5.
+__attribute__((unused))
 void mac_to_short_id(const char* mac, char* out7) {
     uint32_t h = 2166136261UL;
     for (const char* p = mac; *p; p++) { h ^= (uint8_t)*p; h *= 16777619UL; }
@@ -4158,20 +4172,35 @@ void draw_device_info_screen() {
         char mv_str[10]; snprintf(mv_str, sizeof(mv_str), " %dmV", (int)bat_mv_snap);
         spr.print(mv_str);
 
-        // Runtime estimate card (right) — based on ~180mA average consumption, 500mAh battery
+        // Runtime estimate card (right) — load-aware estimate based on current draw
         drawCard(COL_R, row5_y, CARD_W, CARD_H);
         spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
         spr.setCursor(COL_R + 4, row5_y + 4); kprint(spr, "RUNTIME");
         const int BATT_MAH = 500;
-        const int AVG_MA   = 180;
-        int runtime_min = (bat_pct_snap * BATT_MAH) / AVG_MA; // minutes approx
-        int rt_h = runtime_min / 60;
-        int rt_m = runtime_min % 60;
-        char rt_str[12]; snprintf(rt_str, sizeof(rt_str), "~%dh%02dm", rt_h, rt_m);
-        spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1);
-        spr.setCursor(COL_R + 4, row5_y + 16); spr.print(rt_str);
-        spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
-        spr.setCursor(COL_R + 4, row5_y + 28); spr.print("est @180mA");
+
+        bool is_chg = is_device_charging(bat_mv_snap);
+        // Stealth mode (display off) cuts ~100mA. Active scanning baseline ~180mA.
+        int est_ma = stealth_mode ? 80 : 180;
+
+        if (is_chg) {
+            spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
+            spr.setCursor(COL_R + 4, row5_y + 16); spr.print("CHARGING");
+            spr.setTextColor(DIM_COLOR, CARD_COLOR);
+            spr.setCursor(COL_R + 4, row5_y + 28); spr.print("est --");
+        } else {
+            int runtime_min = (bat_pct_snap * BATT_MAH) / est_ma;
+            if (runtime_min < 0) runtime_min = 0;
+            if (runtime_min > 999) runtime_min = 999;  // cap display sanity
+            int rt_h = runtime_min / 60;
+            int rt_m = runtime_min % 60;
+            char rt_str[12]; snprintf(rt_str, sizeof(rt_str), "~%dh%02dm", rt_h, rt_m);
+            spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1);
+            spr.setCursor(COL_R + 4, row5_y + 16); spr.print(rt_str);
+            spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
+            char est_lbl[14];
+            snprintf(est_lbl, sizeof(est_lbl), "est @%dmA", est_ma);
+            spr.setCursor(COL_R + 4, row5_y + 28); spr.print(est_lbl);
+        }
     }
 
     // Row 6: SD STATUS card (full width)
@@ -4567,18 +4596,30 @@ void loop() {
                     trigger_alarm_confidence = 100; 
                 }
             }
-            else if (c == 't') { 
+            else if (c == 't') {
                 if (!stealth_mode && capture_history_count > 0) {
                     static int target_select_idx = -1;
                     xSemaphoreTake(dataMutex, portMAX_DELAY);
                     int current_hist_count = capture_history_count;
+                    if (current_hist_count <= 0) {
+                        // Defensive: should not happen given outer check, but guards against
+                        // race with session reset clearing capture_history_count
+                        xSemaphoreGive(dataMutex);
+                        trigger_toast("TARGET", "No history", 0);
+                        continue;
+                    }
+                    // Bound idx defensively before incrementing (guards against stale value)
+                    if (target_select_idx < 0 || target_select_idx >= current_hist_count) {
+                        target_select_idx = -1;
+                    }
                     target_select_idx = (target_select_idx + 1) % current_hist_count;
                     char t_mac[18];  strncpy(t_mac,  capture_history[target_select_idx].mac,  17); t_mac[17]  = '\0';
                     char t_name[65]; strncpy(t_name, capture_history[target_select_idx].name, 64); t_name[64] = '\0';
+                    char t_type[16]; strncpy(t_type, capture_history[target_select_idx].type, 15); t_type[15] = '\0';
                     int t_conf = capture_history[target_select_idx].confidence;
                     xSemaphoreGive(dataMutex);
-                    
-                    locator_start(t_mac, t_name, capture_history[target_select_idx].type);
+
+                    locator_start(t_mac, t_name, t_type);
                     trigger_toast("TARGET", t_name, t_conf);
                     transition_screen(1, 1);
                 } else if (!stealth_mode) {
@@ -4630,7 +4671,21 @@ void loop() {
                     session_flock_ble = 0;
                     session_raven = 0;
                     session_start_time = millis();
+                    last_buzzer_time = 0;       // clear alarm cooldown indicator
+                    last_blip_time = 0;         // restore scanner ambient immediately
+                    capture_history_count = 0;  // clear in-memory capture list (last_cap_* preserved)
+                    // Clear scanner radial spikes
+                    for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
+                        radial_spikes[i] = 0;
+                        radial_spike_birth[i] = 0;
+                    }
                     xSemaphoreGive(dataMutex);
+
+                    // Clear toast queue
+                    toast_queue_count = 0;
+                    toast_queue_head = 0;
+                    toast_active = false;
+
                     trigger_toast("TARGET", "Session reset", 0);
                     beep(800, 60);
                     draw_current_screen();
