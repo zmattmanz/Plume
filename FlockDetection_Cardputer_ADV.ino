@@ -511,7 +511,8 @@ void chargeLedTask(void* pvParameters) {
 // ============================================================================
 // BATTERY ENGINE (OPTIMIZED)
 // ============================================================================
-static float ema_voltage = 0.0f;
+static volatile float ema_voltage = 0.0f;
+static portMUX_TYPE ema_voltage_mux = portMUX_INITIALIZER_UNLOCKED;
 const float EMA_ALPHA = 0.05f;
 
 // Load-Aware Telemetry Variables
@@ -524,18 +525,28 @@ int32_t get_filtered_voltage() {
     static uint32_t last_adc_ms = 0;
     static int32_t cached_raw_mv = 0;
     uint32_t now_adc = (uint32_t)millis();
+
+    // Fast path: return cached EMA without re-reading ADC
     if (cached_raw_mv != 0 && (now_adc - last_adc_ms) < 250) {
-        return (int32_t)ema_voltage;
+        portENTER_CRITICAL(&ema_voltage_mux);
+        int32_t snapshot = (int32_t)ema_voltage;
+        portEXIT_CRITICAL(&ema_voltage_mux);
+        return snapshot;
     }
-    // Inject anticipated peripheral voltage sag before applying the EMA filter
+
+    // Slow path: read ADC and update EMA atomically
     int32_t raw_mv = M5Cardputer.Power.getBatteryVoltage() + current_load_sag_mv;
     cached_raw_mv = raw_mv;
     last_adc_ms = now_adc;
+
+    portENTER_CRITICAL(&ema_voltage_mux);
     if (ema_voltage == 0.0f) {
         ema_voltage = (float)raw_mv;
     }
     ema_voltage = (EMA_ALPHA * raw_mv) + ((1.0f - EMA_ALPHA) * ema_voltage);
-    return (int32_t)ema_voltage;
+    int32_t result = (int32_t)ema_voltage;
+    portEXIT_CRITICAL(&ema_voltage_mux);
+    return result;
 }
 
 void update_load_sag() {
@@ -851,17 +862,53 @@ uint16_t confidence_color(int score) {
     return TEXT_COLOR;
 }
 
+// Returns current UTC epoch from GPS if valid, else falls back to anchored uptime.
+// Caller must NOT hold dataMutex — this function takes it internally.
+static uint32_t get_pcap_epoch_now(uint32_t* out_usec) {
+    static const uint32_t PCAP_EPOCH_BASE = 1700000000UL;
+    bool gps_valid = false;
+    uint32_t gps_epoch = 0;
+    uint32_t gps_usec = 0;
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2024) {
+        struct tm t = {};
+        t.tm_year = gps.date.year() - 1900;
+        t.tm_mon  = gps.date.month() - 1;
+        t.tm_mday = gps.date.day();
+        t.tm_hour = gps.time.hour();
+        t.tm_min  = gps.time.minute();
+        t.tm_sec  = gps.time.second();
+        time_t epoch = mktime(&t);
+        if (epoch > 0) {
+            gps_epoch = (uint32_t)epoch;
+            gps_usec  = (uint32_t)(gps.time.centisecond()) * 10000UL;  // cs → us
+            gps_valid = true;
+        }
+    }
+    xSemaphoreGive(dataMutex);
+
+    if (gps_valid) {
+        if (out_usec) *out_usec = gps_usec;
+        return gps_epoch;
+    }
+    unsigned long now_ms = millis();
+    if (out_usec) *out_usec = (uint32_t)((now_ms % 1000UL) * 1000UL);
+    return PCAP_EPOCH_BASE + (uint32_t)(now_ms / 1000UL);
+}
+
 void write_threat_pcap(const uint8_t* payload, uint32_t length) {
     if (!sd_available) return;
     uint32_t capture_len = (length > 256) ? 256 : length;
+
+    // Compute timestamp BEFORE taking dataMutex (helper takes it internally)
+    uint32_t pcap_usec;
+    uint32_t pcap_sec = get_pcap_epoch_now(&pcap_usec);
+
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     if (pcap_write_count < MAX_PCAP_BUFFER) {
-        unsigned long now_ms = millis();
-        const uint32_t PCAP_EPOCH_BASE = 1700000000UL;
-        uint32_t elapsed_sec  = (uint32_t)(now_ms / 1000UL);
-        uint32_t elapsed_usec = (uint32_t)((now_ms % 1000UL) * 1000UL);
-        pcap_write_buffer[pcap_write_count].ts_sec  = PCAP_EPOCH_BASE + elapsed_sec;
-        pcap_write_buffer[pcap_write_count].ts_usec = elapsed_usec;
+        pcap_write_buffer[pcap_write_count].ts_sec  = pcap_sec;
+        pcap_write_buffer[pcap_write_count].ts_usec = pcap_usec;
         pcap_write_buffer[pcap_write_count].incl_len = capture_len;
         pcap_write_buffer[pcap_write_count].orig_len = length;
         memcpy(pcap_write_buffer[pcap_write_count].payload, payload, capture_len);
@@ -873,14 +920,15 @@ void write_threat_pcap(const uint8_t* payload, uint32_t length) {
 void write_ble_pcap(const uint8_t* payload, uint32_t length) {
     if (!sd_available) return;
     uint32_t capture_len = (length > 256) ? 256 : length;
+
+    // Compute timestamp BEFORE taking dataMutex (helper takes it internally)
+    uint32_t pcap_usec;
+    uint32_t pcap_sec = get_pcap_epoch_now(&pcap_usec);
+
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     if (ble_pcap_write_count < MAX_PCAP_BUFFER) {
-        unsigned long now_ms = millis();
-        const uint32_t PCAP_EPOCH_BASE = 1700000000UL;
-        uint32_t elapsed_sec  = (uint32_t)(now_ms / 1000UL);
-        uint32_t elapsed_usec = (uint32_t)((now_ms % 1000UL) * 1000UL);
-        ble_pcap_write_buffer[ble_pcap_write_count].ts_sec  = PCAP_EPOCH_BASE + elapsed_sec;
-        ble_pcap_write_buffer[ble_pcap_write_count].ts_usec = elapsed_usec;
+        ble_pcap_write_buffer[ble_pcap_write_count].ts_sec  = pcap_sec;
+        ble_pcap_write_buffer[ble_pcap_write_count].ts_usec = pcap_usec;
         ble_pcap_write_buffer[ble_pcap_write_count].incl_len = capture_len;
         ble_pcap_write_buffer[ble_pcap_write_count].orig_len = length;
         memcpy(ble_pcap_write_buffer[ble_pcap_write_count].payload, payload, capture_len);
@@ -956,11 +1004,16 @@ bool export_mode_start() {
         return false;
     }
 
-    // Shut down promiscuous sniffing before joining a network
+    // Full WiFi stack teardown before joining a network — disabling promiscuous
+    // alone leaves residual state that causes intermittent join failures.
     esp_wifi_set_promiscuous(false);
+    delay(50);
     WiFi.disconnect(true);
     delay(100);
+    WiFi.mode(WIFI_OFF);
+    delay(150);
     WiFi.mode(WIFI_STA);
+    delay(50);
     WiFi.begin(export_ssid, export_pass);
 
     unsigned long connect_start = millis();
@@ -1014,6 +1067,16 @@ void export_mode_stop() {
     esp_wifi_set_promiscuous_filter(&pf);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+
+    // Restart BLE — the scan stops cleanly when WiFi takes over the radio,
+    // but does not auto-resume after WiFi releases. Force ScannerLoopTask to
+    // kick off a new scan cycle on its next iteration.
+    if (pBLEScan) {
+        if (pBLEScan->isScanning()) pBLEScan->stop();
+        pBLEScan->clearResults();
+        last_ble_scan = 0;  // force immediate restart on next ScannerLoopTask iteration
+    }
+
     export_mode_active = false;
     strncpy(toast_text, "EXPORT MODE OFF", sizeof(toast_text) - 1);
     toast_text[sizeof(toast_text) - 1] = '\0';
@@ -1075,56 +1138,83 @@ void load_sd_history() {
     File f = SD.open(current_log_file.c_str(), FILE_READ);
     if (!f) return;
 
-    // Ring buffer: keep last SD_HIST_SIZE parsed entries
+    size_t file_size = f.size();
+    if (file_size < 16) { f.close(); return; }
+
+    // Read tail of file: enough to contain SD_HIST_SIZE * ~256-byte average lines.
+    // Cap at 16KB which is plenty for 20 detection records and easily fits in RAM.
+    const size_t TAIL_BYTES = 16384;
+    size_t read_start = (file_size > TAIL_BYTES) ? (file_size - TAIL_BYTES) : 0;
+    size_t read_len = file_size - read_start;
+
+    f.seek(read_start);
+
+    char* tail_buf = (char*)malloc(read_len + 1);
+    if (!tail_buf) { f.close(); return; }
+    int actual_read = f.read((uint8_t*)tail_buf, read_len);
+    f.close();
+    if (actual_read <= 0) { free(tail_buf); return; }
+    tail_buf[actual_read] = '\0';
+
+    // If we started mid-file, discard the first (potentially partial) line.
+    char* parse_start = tail_buf;
+    if (read_start > 0) {
+        char* nl = strchr(tail_buf, '\n');
+        if (!nl) { free(tail_buf); return; }
+        parse_start = nl + 1;
+    }
+
+    // Walk forward through complete lines, keeping last SD_HIST_SIZE in a ring.
+    // CSV v9.3 schema: Uptime_ms=0,EpochUTC=1,EpochIsGPS=2,Channel=3,Type=4,
+    //                  Proto=5,RSSI=6,MAC=7,Name=8,TXPower=9,Method=10,Conf=11,...
     SDHistEntry ring[SD_HIST_SIZE];
     int ri = 0, total = 0;
-    char buf[SD_LINE_LEN];
 
-    while (f.available()) {
-        int len = 0;
-        while (len < SD_LINE_LEN - 1 && f.available()) {
-            char c = (char)f.read();
-            if (c == '\n' || c == '\r') break;
-            buf[len++] = c;
-        }
-        buf[len] = '\0';
-        if (len < 10) continue;
+    char* line_start = parse_start;
+    while (line_start < tail_buf + actual_read) {
+        char* nl = strchr(line_start, '\n');
+        int len = nl ? (nl - line_start) : ((tail_buf + actual_read) - line_start);
 
-        // CSV: 0=ts,1=chan,2=type,3=proto,4=rssi,5=mac,6=name,7=txpwr,8=method,9=conf,...
-        int fs[11]; int fc = 0;
-        fs[0] = 0;
-        for (int ci = 0; ci < len && fc < 10; ci++) {
-            if (buf[ci] == ',') fs[++fc] = ci + 1;
-        }
-        if (fc < 9) { total++; continue; }
+        if (len > 0 && line_start[len - 1] == '\r') len--;
 
-        // Extract a field: from fs[n] up to the next comma (or end of buf)
-        auto copy_f = [&](int n, char* dest, int maxlen) {
-            int start = fs[n];
-            int end = start;
-            while (end < len && buf[end] != ',') end++;
-            int flen = end - start;
-            if (flen >= maxlen) flen = maxlen - 1;
-            strncpy(dest, buf + start, flen);
-            dest[flen] = '\0';
-        };
+        if (len >= 10) {
+            int fs[13]; int fc = 0;
+            fs[0] = 0;
+            for (int ci = 0; ci < len && fc < 12; ci++) {
+                if (line_start[ci] == ',') fs[++fc] = ci + 1;
+            }
+            if (fc >= 11) {
+                auto copy_f = [&](int n, char* dest, int maxlen) {
+                    int start = fs[n];
+                    int end = start;
+                    while (end < len && line_start[end] != ',') end++;
+                    int flen = end - start;
+                    if (flen >= maxlen) flen = maxlen - 1;
+                    strncpy(dest, line_start + start, flen);
+                    dest[flen] = '\0';
+                };
 
-        SDHistEntry& e = ring[ri % SD_HIST_SIZE];
-        copy_f(2, e.type,   16);
-        copy_f(5, e.mac,    18);
-        copy_f(6, e.name,   32);
-        copy_f(8, e.method, 24);
-        e.rssi       = atoi(buf + fs[4]);
-        e.confidence = atoi(buf + fs[9]);
-        {
-            unsigned long uptime = (unsigned long)strtoul(buf + fs[0], NULL, 10);
-            format_time_buf(uptime / 1000, e.timestamp, sizeof(e.timestamp));
+                SDHistEntry& e = ring[ri % SD_HIST_SIZE];
+                copy_f(4,  e.type,   16);
+                copy_f(7,  e.mac,    18);
+                copy_f(8,  e.name,   32);
+                copy_f(10, e.method, 24);
+                e.rssi       = atoi(line_start + fs[6]);
+                e.confidence = atoi(line_start + fs[11]);
+                {
+                    unsigned long uptime = (unsigned long)strtoul(line_start + fs[0], NULL, 10);
+                    format_time_buf(uptime / 1000, e.timestamp, sizeof(e.timestamp));
+                }
+                ri++;
+                total++;
+            }
         }
 
-        ri++;
-        total++;
+        if (!nl) break;
+        line_start = nl + 1;
     }
-    f.close();
+
+    free(tail_buf);
 
     int count = (total < SD_HIST_SIZE) ? total : SD_HIST_SIZE;
     sd_hist_count = count;
@@ -1729,10 +1819,9 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     bool is_probe_req = (frame_subtype == 4);
     if (!is_beacon && !is_probe_req) return;
 
-    uint8_t next = (wifi_eq_write_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
-    if (wifi_event_queue[next].ready) return;
-
     WifiEvent* ev = &wifi_event_queue[wifi_eq_write_idx];
+    if (ev->ready) return;  // current slot still has unread data, drop this packet
+    uint8_t next = (wifi_eq_write_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
 
     memset(ev->ssid, 0, sizeof(ev->ssid));
     uint8_t* frame_body    = (uint8_t*)ipkt + 24;
@@ -1815,6 +1904,7 @@ void process_wifi_event_queue() {
 
         WifiEvent local;
         memcpy(&local, ev, sizeof(WifiEvent));
+        __sync_synchronize();  // ensure memcpy completes before clearing ready flag
         ev->ready = false;
         wifi_eq_read_idx = (wifi_eq_read_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
 
@@ -1912,12 +2002,40 @@ struct BleEventData {
     uint8_t  adv_channel;  // 37/38/39 if available, 0 if unknown
 };
 
+#define BLE_EVENT_POOL_SIZE 16
+static BleEventData ble_event_pool[BLE_EVENT_POOL_SIZE];
+static volatile bool ble_event_pool_in_use[BLE_EVENT_POOL_SIZE] = {false};
+static portMUX_TYPE ble_pool_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static BleEventData* ble_pool_acquire() {
+    BleEventData* result = nullptr;
+    portENTER_CRITICAL(&ble_pool_mux);
+    for (int i = 0; i < BLE_EVENT_POOL_SIZE; i++) {
+        if (!ble_event_pool_in_use[i]) {
+            ble_event_pool_in_use[i] = true;
+            result = &ble_event_pool[i];
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&ble_pool_mux);
+    return result;
+}
+
+static void ble_pool_release(BleEventData* ev) {
+    if (!ev) return;
+    int idx = ev - ble_event_pool;
+    if (idx < 0 || idx >= BLE_EVENT_POOL_SIZE) return;
+    portENTER_CRITICAL(&ble_pool_mux);
+    ble_event_pool_in_use[idx] = false;
+    portEXIT_CRITICAL(&ble_pool_mux);
+}
+
 static void ble_worker_task(void* pvParameters) {
     BleEventData* ev;
     for (;;) {
         if (xQueueReceive(ble_event_queue, &ev, portMAX_DELAY) != pdTRUE) continue;
 
-        if (ev->rssi < IGNORE_WEAK_RSSI) { free(ev); continue; }
+        if (ev->rssi < IGNORE_WEAK_RSSI) { ble_pool_release(ev); continue; }
 
         int  confidence   = 0;
         char methods[64]  = {0};
@@ -2082,14 +2200,14 @@ static void ble_worker_task(void* pvParameters) {
             xSemaphoreGive(dataMutex);
         }
 
-        free(ev);
+        ble_pool_release(ev);
     }
 }
 
 class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
-        BleEventData* ev = (BleEventData*)malloc(sizeof(BleEventData));
-        if (!ev) return;
+        BleEventData* ev = ble_pool_acquire();
+        if (!ev) return;  // pool exhausted; drop this advertisement
 
         memset(ev, 0, sizeof(BleEventData));
 
@@ -2133,7 +2251,7 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
         // NimBLE does not reliably expose advertising channel on ESP32.
         ev->adv_channel = 0;
 
-        if (xQueueSend(ble_event_queue, &ev, 0) != pdTRUE) { free(ev); }
+        if (xQueueSend(ble_event_queue, &ev, 0) != pdTRUE) { ble_pool_release(ev); }
     }
 };
 
