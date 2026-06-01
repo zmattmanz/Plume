@@ -4036,6 +4036,8 @@ static WifiEvent wifi_event_queue[WIFI_EVENT_QUEUE_SIZE];
 // Written only from the WiFi promiscuous callback (single task context on Core 0).
 static volatile uint32_t wifi_eq_write_idx = 0;
 static uint8_t           wifi_eq_read_idx  = 0;
+static volatile uint32_t wifi_pkt_enqueued = 0;
+static volatile uint32_t wifi_pkt_dropped  = 0;
 
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     if (!scanner_ready) return;
@@ -4065,7 +4067,10 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     // previous "next.ready" gate wasted a slot and capped capacity at 7
     // when the consumer was even one step behind.
     uint32_t cur_idx = __atomic_load_n(&wifi_eq_write_idx, __ATOMIC_RELAXED);
-    if (__atomic_load_n(&wifi_event_queue[cur_idx].ready, __ATOMIC_ACQUIRE)) return;
+    if (__atomic_load_n(&wifi_event_queue[cur_idx].ready, __ATOMIC_ACQUIRE)) {
+        __atomic_fetch_add(&wifi_pkt_dropped, 1u, __ATOMIC_RELAXED);
+        return;
+    }
     uint32_t next = (cur_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
 
     WifiEvent* ev = &wifi_event_queue[cur_idx];
@@ -4100,6 +4105,7 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     ev->vendor_oui_count = 0;
 
     __atomic_store_n(&ev->ready, 1u, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&wifi_pkt_enqueued, 1u, __ATOMIC_RELAXED);
     __atomic_store_n(&wifi_eq_write_idx, next, __ATOMIC_RELAXED);
 }
 
@@ -10628,6 +10634,11 @@ static void service_heap_health() {
         Serial.printf("[HEAPLOG] free=%u min_free=%u largest=%u min_largest=%u\n",
                       (unsigned)free_heap, (unsigned)min_heap_seen,
                       (unsigned)largest_block, (unsigned)min_largest_seen);
+        uint32_t enq  = __atomic_load_n(&wifi_pkt_enqueued, __ATOMIC_RELAXED);
+        uint32_t drop = __atomic_load_n(&wifi_pkt_dropped,  __ATOMIC_RELAXED);
+        uint32_t pct  = (enq + drop > 0) ? (drop * 100u / (enq + drop)) : 0u;
+        Serial.printf("[LOADLOG] enq=%u drop=%u drop_pct=%u free=%u largest=%u\n",
+                      enq, drop, pct, (unsigned)free_heap, (unsigned)largest_block);
     }
 }
 
