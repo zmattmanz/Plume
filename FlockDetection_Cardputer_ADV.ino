@@ -10618,6 +10618,17 @@ static void service_heap_health() {
                           (unsigned)largest_block, (unsigned)free_heap);
         }
     }
+    // Diagnostic: free >> 15000 but largest near/below it -> FRAGMENTATION
+    //             free itself dropping toward 15000             -> EXHAUSTION
+    static size_t min_largest_seen = 999999;
+    if (largest_block < min_largest_seen) min_largest_seen = largest_block;
+    static unsigned long last_heaplog_ms = 0;
+    if (millis() - last_heaplog_ms >= 5000) {
+        last_heaplog_ms = millis();
+        Serial.printf("[HEAPLOG] free=%u min_free=%u largest=%u min_largest=%u\n",
+                      (unsigned)free_heap, (unsigned)min_heap_seen,
+                      (unsigned)largest_block, (unsigned)min_largest_seen);
+    }
 }
 
 static void service_ambient_mode() {
