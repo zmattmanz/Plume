@@ -4036,8 +4036,11 @@ static WifiEvent wifi_event_queue[WIFI_EVENT_QUEUE_SIZE];
 // Written only from the WiFi promiscuous callback (single task context on Core 0).
 static volatile uint32_t wifi_eq_write_idx = 0;
 static uint8_t           wifi_eq_read_idx  = 0;
+<<<<<<< HEAD
 static volatile uint32_t wifi_pkt_enqueued = 0;
 static volatile uint32_t wifi_pkt_dropped  = 0;
+=======
+>>>>>>> 588f71f637d88b87d7903e9050b763bba1218073
 
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     if (!scanner_ready) return;
@@ -4067,10 +4070,14 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     // previous "next.ready" gate wasted a slot and capped capacity at 7
     // when the consumer was even one step behind.
     uint32_t cur_idx = __atomic_load_n(&wifi_eq_write_idx, __ATOMIC_RELAXED);
+<<<<<<< HEAD
     if (__atomic_load_n(&wifi_event_queue[cur_idx].ready, __ATOMIC_ACQUIRE)) {
         __atomic_fetch_add(&wifi_pkt_dropped, 1u, __ATOMIC_RELAXED);
         return;
     }
+=======
+    if (__atomic_load_n(&wifi_event_queue[cur_idx].ready, __ATOMIC_ACQUIRE)) return;
+>>>>>>> 588f71f637d88b87d7903e9050b763bba1218073
     uint32_t next = (cur_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
 
     WifiEvent* ev = &wifi_event_queue[cur_idx];
@@ -4105,7 +4112,10 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     ev->vendor_oui_count = 0;
 
     __atomic_store_n(&ev->ready, 1u, __ATOMIC_RELEASE);
+<<<<<<< HEAD
     __atomic_fetch_add(&wifi_pkt_enqueued, 1u, __ATOMIC_RELAXED);
+=======
+>>>>>>> 588f71f637d88b87d7903e9050b763bba1218073
     __atomic_store_n(&wifi_eq_write_idx, next, __ATOMIC_RELAXED);
 }
 
@@ -10624,6 +10634,7 @@ static void service_heap_health() {
                           (unsigned)largest_block, (unsigned)free_heap);
         }
     }
+<<<<<<< HEAD
     // Diagnostic: free >> 15000 but largest near/below it -> FRAGMENTATION
     //             free itself dropping toward 15000             -> EXHAUSTION
     static size_t min_largest_seen = 999999;
@@ -10640,6 +10651,8 @@ static void service_heap_health() {
         Serial.printf("[LOADLOG] enq=%u drop=%u drop_pct=%u free=%u largest=%u\n",
                       enq, drop, pct, (unsigned)free_heap, (unsigned)largest_block);
     }
+=======
+>>>>>>> 588f71f637d88b87d7903e9050b763bba1218073
 }
 
 static void service_ambient_mode() {
