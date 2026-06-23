@@ -1,10 +1,9 @@
 {
-  "additionalFiles": "..\\..\\..,..\\..,..\\..",
-  "builtInLibrariesFolders": "C:\\Users\\zmatt\\AppData\\Local\\Arduino15\\libraries",
+  "additionalFiles": "..\\..\\..,..\\..,..\\..,..\\..",
   "compiler.optimization_flags": "-Os",
   "customBuildProperties": "",
   "fqbn": "esp32:esp32:m5stack_cardputer:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=cdc,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=8M,PartitionScheme=huge_app,DebugLevel=none,PSRAM=disabled,LoopCore=1,EventsCore=1,EraseFlash=all,JTAGAdapter=default",
   "hardwareFolders": "C:\\Users\\zmatt\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.5,C:\\Users\\zmatt\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.5",
-  "otherLibrariesFolders": "c:\\Users\\zmatt\\Documents\\Arduino\\libraries",
+  "otherLibrariesFolders": "C:\\Users\\zmatt\\Documents\\Arduino\\libraries,C:\\Users\\zmatt\\Documents\\Arduino\\libraries",
   "sketchLocation": "C:\\Users\\zmatt\\Documents\\Development\\FlockDetection_Cardputer_ADV\\FlockDetection_Cardputer_ADV"
 }

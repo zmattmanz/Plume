@@ -504,7 +504,7 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
 
 #define GPS_RX_PIN   15
 #define GPS_TX_PIN   13   
-#define GPS_BAUD     115200 
+#define GPS_BAUD     9600     // AT6668/ATGM336H (Cap LoRa-1262) default; tried first by auto-detect
 
 #define MAX_CHANNEL 13
 #define BLE_SCAN_DURATION 2
@@ -1192,6 +1192,51 @@ static bool   signal_peak_has_gps = false;
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(2);
 
+// Probe common GNSS baud rates and leave SerialGPS open at the one that
+// produces valid NMEA. Returns the detected baud, or 0 if none matched
+// (caller falls back to GPS_BAUD). Tries the module default first.
+static uint32_t gps_detect_baud() {
+    const uint32_t candidates[] = { GPS_BAUD, 115200, 38400 };
+    char line[100];
+    for (uint32_t b : candidates) {
+        SerialGPS.end();
+        delay(20);
+        SerialGPS.setRxBufferSize(256);   // must precede begin()
+        SerialGPS.begin(b, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
+        // Discard the framing noise produced by the baud switch.
+        uint32_t flush_until = millis() + 100;
+        while (millis() < flush_until) { while (SerialGPS.available()) SerialGPS.read(); }
+
+        // Listen up to 1200 ms for one clean sentence: '$G' ... '*' ... newline.
+        int  idx = 0;
+        bool in_sentence = false;
+        uint32_t deadline = millis() + 1200;
+        while (millis() < deadline) {
+            while (SerialGPS.available()) {
+                char c = (char)SerialGPS.read();
+                if (c == '$') { idx = 0; in_sentence = true; line[idx++] = c; continue; }
+                if (!in_sentence) continue;
+                if (c == '\r' || c == '\n') {
+                    line[idx] = '\0';
+                    if (idx >= 7 && line[1] == 'G' && strchr(line, '*')) {
+                        Serial.printf("[gps] detected baud=%u (%s)\n", (unsigned)b, line);
+                        return b;
+                    }
+                    in_sentence = false; idx = 0;
+                } else if (idx < (int)sizeof(line) - 1) {
+                    line[idx++] = c;
+                } else {
+                    in_sentence = false; idx = 0;   // overrun -> resync
+                }
+            }
+            delay(2);   // yield so the scheduler / idle WDT stay fed
+        }
+        Serial.printf("[gps] no NMEA at baud=%u\n", (unsigned)b);
+    }
+    return 0;
+}
+
 // ── Auto timezone from GPS ──────────────────────────────────────────
 // Derived from longitude + US DST rules. Recomputed every 5 minutes.
 // Applied at display time only — stored timestamps stay UTC.
@@ -1337,7 +1382,8 @@ void LedTask(void* pv) {
 // BATTERY ENGINE (OPTIMIZED)
 // ============================================================================
 static float ema_voltage = 0.0f;
-const float EMA_ALPHA = 0.05f;
+const float EMA_ALPHA = 0.05f;          // discharge: heavy smoothing
+const float EMA_ALPHA_CHARGING = 0.30f; // charging: track the rising cell (~8 samples to converge)
 
 // Load-Aware Telemetry Variables
 static int32_t current_load_sag_mv = 0;
@@ -1352,14 +1398,21 @@ int32_t get_filtered_voltage() {
     if (cached_raw_mv != 0 && (now_adc - last_adc_ms) < 250) {
         return (int32_t)ema_voltage;
     }
-    // Inject anticipated peripheral voltage sag before applying the EMA filter
-    int32_t raw_mv = M5Cardputer.Power.getBatteryVoltage() + current_load_sag_mv;
+    // When charging, the charger supplies the peripheral load, so the
+    // discharge sag model does not apply — adding it would corrupt the
+    // reading. We also converge faster so the display tracks the rising
+    // cell instead of crawling behind the discharge-tuned filter.
+    bool    charging = M5Cardputer.Power.isCharging();
+    int32_t sag      = charging ? 0 : current_load_sag_mv;
+    float   alpha    = charging ? EMA_ALPHA_CHARGING : EMA_ALPHA;
+
+    int32_t raw_mv = M5Cardputer.Power.getBatteryVoltage() + sag;
     cached_raw_mv = raw_mv;
     last_adc_ms = now_adc;
     if (ema_voltage == 0.0f) {
         ema_voltage = (float)raw_mv;
     }
-    ema_voltage = (EMA_ALPHA * raw_mv) + ((1.0f - EMA_ALPHA) * ema_voltage);
+    ema_voltage = (alpha * raw_mv) + ((1.0f - alpha) * ema_voltage);
     return (int32_t)ema_voltage;
 }
 
@@ -10394,10 +10447,17 @@ void setup() {
     Serial.print(F(" BLE:"));     Serial.println(rt_name_count);
 
     delay(100);
-    // NMEA sentences max ~82 chars — 1024-byte default RX is 2× too big.
-    // setRxBufferSize must be called BEFORE begin() to take effect.
-    SerialGPS.setRxBufferSize(256);  // NMEA max sentence is 82 bytes; 256 is sufficient
-    SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    // Auto-detect the GNSS baud. On success the port is left open at the
+    // detected rate; on failure we open at the module default and let the
+    // GPS task keep trying (covers a slow-to-emit cold start).
+    uint32_t detected = gps_detect_baud();
+    if (detected == 0) {
+        Serial.printf("[gps] auto-detect failed; defaulting to %u\n", (unsigned)GPS_BAUD);
+        SerialGPS.end();
+        delay(20);
+        SerialGPS.setRxBufferSize(256);
+        SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    }
     delay(WIFI_MODE_SETTLE_MEDIUM_MS);
     WiFi.mode(WIFI_STA); delay(WIFI_MODE_SETTLE_SHORT_MS);
     boot_animate(38 + random(0, 4), "connecting GPS");
@@ -11942,6 +12002,16 @@ void loop() {
     update_load_sag();
 
     int32_t loop_mv = get_filtered_voltage();
+
+    static uint32_t _bat_dbg_ms = 0;
+    if (millis() - _bat_dbg_ms >= 1000) {
+        _bat_dbg_ms = millis();
+        Serial.printf("[bat] raw=%dmV filtered=%dmV sag=%dmV charging=%d\n",
+            (int)M5Cardputer.Power.getBatteryVoltage(),
+            (int)get_filtered_voltage(),
+            (int)current_load_sag_mv,
+            (int)M5Cardputer.Power.isCharging());
+    }
 
     service_battery_warnings(loop_mv);
 
