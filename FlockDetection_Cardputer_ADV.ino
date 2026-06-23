@@ -508,8 +508,11 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
 
 #define MAX_CHANNEL 13
 #define BLE_SCAN_DURATION 2
-#define BLE_SCAN_INTERVAL      3000   // normal inter-scan gap (ms)
-#define BLE_SCAN_INTERVAL_LOCK  800   // boosted gap during 10s channel lock window
+// BLE TX power. Detector is RX-dominated; TX only matters for active-scan
+// SCAN_REQ. P3 (+3dBm) trims the peak draw with negligible detection loss.
+// Bump to ESP_PWR_LVL_P6 if active-scan range matters in the field.
+#define BLE_TX_POWER ESP_PWR_LVL_P3
+// BLE_SCAN_INTERVAL removed — sessions run back-to-back (A1 timing)
 // Brief global cooldown — prevents two alarms firing in the same audio
 // envelope when multiple detections from different devices arrive in the
 // same scanner tick. The 5-minute seen-MAC dedup is the real repeat
@@ -549,6 +552,13 @@ static inline unsigned long current_dedup_window_ms() {
 #define SCORE_STRONG     60   
 #define SCORE_WEAK       25   
 #define SCORE_BONUS_RSSI 10
+#define CONF_BONUS_TX_POWER  8    // corroborator only; below alarm threshold alone
+#define TX_POWER_MIN_DBM     0    // dBm floor; phones often omit or use negative values
+
+// Wildcard-probe behavioral tracker constants
+#define WILDCARD_MIN_CHANNELS   3      // Distinct channels to confirm the cross-channel hopping signature
+#define WILDCARD_WINDOW_MS      30000  // Observation window (ms) — reset per MAC on expiry
+#define WILDCARD_TRACKER_SIZE   32     // Max simultaneously-tracked source MACs (fixed-size, no alloc)
 
 #define CONFIDENCE_ALARM_THRESHOLD 75   
 #define CONFIDENCE_HIGH            85   
@@ -1435,6 +1445,9 @@ void clean_device_name_char(char* str) {
     str[write_idx] = '\0';
 }
 
+enum OuiTier { OUI_NONE = 0, OUI_SPECIFIC = 1, OUI_GENERIC = 2 };
+struct OuiEntry { const char* prefix; uint8_t tier; };
+
 // ============================================================================
 // SIGNATURE DATABASE
 // ============================================================================
@@ -1444,38 +1457,40 @@ static const char* wifi_ssid_patterns[] = {
 };
 static const int NUM_SSID_PATTERNS = sizeof(wifi_ssid_patterns) / sizeof(wifi_ssid_patterns[0]);
 
-static const char* mac_prefixes_tier1[] = {
-    "b4:1e:52",   // Flock Safety — IEEE registered OUI
-    "e4:aa:ea",   // LiteOn — most-observed Flock production OUI
-    "00:09:01",   // XUNTONG — Flock Penguin battery (Field Reference May 2026)
+static const OuiEntry mac_prefixes[] = {
+    // ── OUI_SPECIFIC — directly attributed to Flock Safety or confirmed components ──
+    {"b4:1e:52", OUI_SPECIFIC},   // Flock Safety — IEEE registered OUI
+    {"e4:aa:ea", OUI_SPECIFIC},   // LiteOn — most-observed Flock production OUI
+    {"00:09:01", OUI_SPECIFIC},   // XUNTONG — Flock Penguin battery (Field Reference May 2026)
     // Pending manual IEEE lookup — keep until registrant confirmed or denied
-    "4c:6e:44", "d8:a0:d8", "a0:b7:65", "f0:82:c0", "b4:e3:f9", "04:0d:84"
-};
-static const int NUM_MAC_TIER1 = sizeof(mac_prefixes_tier1) / sizeof(mac_prefixes_tier1[0]);
-
-static const char* mac_prefixes_tier2[] = {
-    "74:4c:a1", "94:34:69", "38:5b:44",
-    "94:08:53", "1c:34:f1", "a4:cf:12",
-    "3c:91:80", "80:30:49", "14:5a:fc", "9c:2f:9d",
-    "c8:c9:a3", "70:c9:4e",
-    "24:b2:b9", "00:f4:8d",
-    "08:3a:88", "d8:f3:bc",
+    {"4c:6e:44", OUI_SPECIFIC}, {"d8:a0:d8", OUI_SPECIFIC}, {"a0:b7:65", OUI_SPECIFIC},
+    {"f0:82:c0", OUI_SPECIFIC}, {"b4:e3:f9", OUI_SPECIFIC}, {"04:0d:84", OUI_SPECIFIC},
+    // ── OUI_GENERIC — commodity / component-vendor silicon ──
+    {"74:4c:a1", OUI_GENERIC}, {"94:34:69", OUI_GENERIC}, {"38:5b:44", OUI_GENERIC},
+    {"94:08:53", OUI_GENERIC}, {"1c:34:f1", OUI_GENERIC}, {"a4:cf:12", OUI_GENERIC},
+    {"d4:ad:fc", OUI_GENERIC},   // Espressif ESP32-S3 (generic commodity silicon)
+    {"ac:67:b2", OUI_GENERIC},   // Espressif ESP32-WROOM (generic commodity silicon)
+    {"3c:91:80", OUI_GENERIC}, {"80:30:49", OUI_GENERIC}, {"14:5a:fc", OUI_GENERIC}, {"9c:2f:9d", OUI_GENERIC},
+    {"c8:c9:a3", OUI_GENERIC}, {"70:c9:4e", OUI_GENERIC},
+    {"24:b2:b9", OUI_GENERIC}, {"00:f4:8d", OUI_GENERIC},
+    {"08:3a:88", OUI_GENERIC}, {"d8:f3:bc", OUI_GENERIC},
     // Field-validated additions from the NitekryDPaul 31-prefix research list.
     // NitekryDPaul entries #22, #23, #26 — demoted from Tier 1 for consistency
     // Same provenance as all other NitekryDPaul OUIs (field-validated component-vendor)
-    "ec:1b:bd", "58:8e:81", "90:35:ea",
-    "b8:35:32", "c0:35:32", "f4:6a:dd", "f8:a2:d6",
-    "e8:d0:fc", "e0:4f:43", "b8:1e:a4", "70:08:94",
-    "3c:71:bf", "58:00:e3", "5c:93:a2", "64:6e:69",
-    "48:27:ea", "82:6b:f2",
+    {"ec:1b:bd", OUI_GENERIC}, {"58:8e:81", OUI_GENERIC}, {"90:35:ea", OUI_GENERIC},
+    {"b8:35:32", OUI_GENERIC}, {"c0:35:32", OUI_GENERIC}, {"f4:6a:dd", OUI_GENERIC}, {"f8:a2:d6", OUI_GENERIC},
+    {"e8:d0:fc", OUI_GENERIC}, {"e0:4f:43", OUI_GENERIC}, {"b8:1e:a4", OUI_GENERIC}, {"70:08:94", OUI_GENERIC},
+    {"3c:71:bf", OUI_GENERIC}, {"58:00:e3", OUI_GENERIC}, {"5c:93:a2", OUI_GENERIC}, {"64:6e:69", OUI_GENERIC},
+    {"48:27:ea", OUI_GENERIC}, {"82:6b:f2", OUI_GENERIC},
     // LiteOn Technology Corporation — WCBN3510A WiFi+BT module
     // Confirmed in Falcon, Sparrow, Falcon Flex, Falcon LR
     // d0:39:57 via NitekryDPaul, e0:0a:f6 via IEEE lookup May 2026
     // e8:2a:44 through 94:97:4f via Field Reference May 2026
-    "d0:39:57", "e0:0a:f6",
-    "e8:2a:44", "30:d1:6b", "b8:ee:65", "a4:db:30", "40:f0:2f", "30:52:cb", "94:97:4f"
+    {"d0:39:57", OUI_GENERIC}, {"e0:0a:f6", OUI_GENERIC},
+    {"e8:2a:44", OUI_GENERIC}, {"30:d1:6b", OUI_GENERIC}, {"b8:ee:65", OUI_GENERIC},
+    {"a4:db:30", OUI_GENERIC}, {"40:f0:2f", OUI_GENERIC}, {"30:52:cb", OUI_GENERIC}, {"94:97:4f", OUI_GENERIC},
 };
-static const int NUM_MAC_TIER2 = sizeof(mac_prefixes_tier2) / sizeof(mac_prefixes_tier2[0]);
+static const int NUM_MAC_PREFIXES = sizeof(mac_prefixes) / sizeof(mac_prefixes[0]);
 
 static const char* device_name_patterns[] = {
     "FS Ext Battery", "Penguin", "Flock", "Pigvision", "FlockCam", "RWLS-"
@@ -1500,23 +1515,148 @@ static const int NUM_RAVEN_STANDARD_UUIDS = sizeof(raven_standard_service_uuids)
 
 #define FLOCK_MFG_COMPANY_ID 0x09C8
 
-int check_mac_prefix_tiered(const uint8_t* mac) {
-    char mac_str[9]; 
+// ── Runtime signature tables (seeded from defaults, optionally replaced by SD) ──
+#define MAX_OUI_RT   64
+#define MAX_SSID_RT  32
+#define MAX_NAME_RT  32
+#define SIG_STR_LEN  33     // max substring length incl. NUL
+#define SIG_FILE     "/flock_signatures.csv"
+
+struct OuiRT { char prefix[9]; uint8_t tier; };
+OuiRT rt_oui[MAX_OUI_RT];                 int rt_oui_count  = 0;
+char  rt_ssid[MAX_SSID_RT][SIG_STR_LEN];  int rt_ssid_count = 0;
+char  rt_name[MAX_NAME_RT][SIG_STR_LEN];  int rt_name_count = 0;
+
+void signatures_seed_defaults() {
+    rt_oui_count = 0;
+    for (int i = 0; i < NUM_MAC_PREFIXES && rt_oui_count < MAX_OUI_RT; i++) {
+        strncpy(rt_oui[rt_oui_count].prefix, mac_prefixes[i].prefix, 8);
+        rt_oui[rt_oui_count].prefix[8] = '\0';
+        rt_oui[rt_oui_count].tier = mac_prefixes[i].tier;
+        rt_oui_count++;
+    }
+    rt_ssid_count = 0;
+    for (int i = 0; i < NUM_SSID_PATTERNS && rt_ssid_count < MAX_SSID_RT; i++) {
+        strncpy(rt_ssid[rt_ssid_count], wifi_ssid_patterns[i], SIG_STR_LEN - 1);
+        rt_ssid[rt_ssid_count][SIG_STR_LEN - 1] = '\0'; rt_ssid_count++;
+    }
+    rt_name_count = 0;
+    for (int i = 0; i < NUM_NAME_PATTERNS && rt_name_count < MAX_NAME_RT; i++) {
+        strncpy(rt_name[rt_name_count], device_name_patterns[i], SIG_STR_LEN - 1);
+        rt_name[rt_name_count][SIG_STR_LEN - 1] = '\0'; rt_name_count++;
+    }
+}
+
+void signatures_load_from_sd() {
+    if (!sd_available || !SD.exists(SIG_FILE)) {
+        Serial.println(F("Signatures: compiled defaults (no SD override)"));
+        return;
+    }
+    File f = SD.open(SIG_FILE, FILE_READ);
+    if (!f) { Serial.println(F("Signatures: SD open failed, using defaults")); return; }
+
+    bool cleared_oui = false, cleared_ssid = false, cleared_name = false;
+    int n_oui = 0, n_ssid = 0, n_name = 0;
+    char line[80];
+
+    while (f.available()) {
+        int len = f.readBytesUntil('\n', line, sizeof(line) - 1);
+        line[len] = '\0';
+        while (len > 0 && (line[len-1] == '\r' || line[len-1] == ' ')) line[--len] = '\0';
+        if (len == 0 || line[0] == '#') continue;
+
+        char* comma = strchr(line, ',');
+        if (!comma) continue;
+        *comma = '\0';
+        char* type  = line;
+        char* value = comma + 1;
+        char* tier_str = strchr(value, ',');
+        if (tier_str) { *tier_str = '\0'; tier_str++; }
+
+        if (strcasecmp(type, "oui") == 0) {
+            if (!cleared_oui) { rt_oui_count = 0; cleared_oui = true; }
+            if (rt_oui_count < MAX_OUI_RT && strlen(value) >= 8) {
+                strncpy(rt_oui[rt_oui_count].prefix, value, 8);
+                rt_oui[rt_oui_count].prefix[8] = '\0';
+                rt_oui[rt_oui_count].tier =
+                    (tier_str && strcasecmp(tier_str, "specific") == 0) ? OUI_SPECIFIC : OUI_GENERIC;
+                rt_oui_count++; n_oui++;
+            }
+        } else if (strcasecmp(type, "ssid") == 0) {
+            if (!cleared_ssid) { rt_ssid_count = 0; cleared_ssid = true; }
+            if (rt_ssid_count < MAX_SSID_RT && strlen(value) > 0) {
+                strncpy(rt_ssid[rt_ssid_count], value, SIG_STR_LEN - 1);
+                rt_ssid[rt_ssid_count][SIG_STR_LEN - 1] = '\0';
+                rt_ssid_count++; n_ssid++;
+            }
+        } else if (strcasecmp(type, "name") == 0) {
+            if (!cleared_name) { rt_name_count = 0; cleared_name = true; }
+            if (rt_name_count < MAX_NAME_RT && strlen(value) > 0) {
+                strncpy(rt_name[rt_name_count], value, SIG_STR_LEN - 1);
+                rt_name[rt_name_count][SIG_STR_LEN - 1] = '\0';
+                rt_name_count++; n_name++;
+            }
+        }
+    }
+    f.close();
+    Serial.printf("Signatures from SD: OUI=%d SSID=%d NAME=%d (absent types kept defaults)\n",
+                  n_oui, n_ssid, n_name);
+}
+
+int check_mac_prefix(const uint8_t* mac) {
+    char mac_str[9];
     snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x", mac[0], mac[1], mac[2]);
-    for (int i = 0; i < NUM_MAC_TIER1; i++) {
-        if (strncmp(mac_str, mac_prefixes_tier1[i], 8) == 0) return 1;
+    for (int i = 0; i < rt_oui_count; i++) {
+        if (strncasecmp(mac_str, rt_oui[i].prefix, 8) == 0) return rt_oui[i].tier;
     }
-    for (int i = 0; i < NUM_MAC_TIER2; i++) {
-        if (strncmp(mac_str, mac_prefixes_tier2[i], 8) == 0) return 2;
+    return OUI_NONE;
+}
+
+// ── Wildcard-probe behavioral tracker ──────────────────────────────────────
+// Tracks which WiFi channels each source MAC has emitted wildcard probe
+// requests on within a rolling window. Returns true once a MAC has been
+// seen on >= WILDCARD_MIN_CHANNELS distinct channels, indicating the
+// channel-hopping pattern characteristic of Flock cameras. Called only
+// from process_wifi_event_queue() (single-threaded consumer) — no mutex.
+struct WildcardProbe {
+    uint8_t       mac[6];
+    uint16_t      channel_mask;   // bit (ch-1) set when a wildcard probe seen on that channel
+    unsigned long first_seen;     // millis() of first wildcard probe in the current window
+};
+static WildcardProbe wildcard_tracker[WILDCARD_TRACKER_SIZE];
+static int           wildcard_count = 0;
+
+static bool wildcard_probe_observe(const uint8_t* mac, uint8_t channel) {
+    if (channel < 1 || channel > MAX_CHANNEL) return false;
+    unsigned long now = millis();
+    int slot = -1, oldest = 0;
+
+    for (int i = 0; i < wildcard_count; i++) {
+        if (memcmp(wildcard_tracker[i].mac, mac, 6) == 0) { slot = i; break; }
+        if (wildcard_tracker[i].first_seen < wildcard_tracker[oldest].first_seen) oldest = i;
     }
-    return 0;
+
+    if (slot >= 0 && (now - wildcard_tracker[slot].first_seen) > WILDCARD_WINDOW_MS) {
+        // Window expired — restart accumulation for this MAC
+        wildcard_tracker[slot].channel_mask = 0;
+        wildcard_tracker[slot].first_seen   = now;
+    }
+
+    if (slot < 0) {
+        if (wildcard_count < WILDCARD_TRACKER_SIZE) slot = wildcard_count++;
+        else slot = oldest;   // evict oldest entry when full
+        memcpy(wildcard_tracker[slot].mac, mac, 6);
+        wildcard_tracker[slot].channel_mask = 0;
+        wildcard_tracker[slot].first_seen   = now;
+    }
+
+    wildcard_tracker[slot].channel_mask |= (uint16_t)(1u << (channel - 1));
+    return (__builtin_popcount(wildcard_tracker[slot].channel_mask) >= WILDCARD_MIN_CHANNELS);
 }
 
 bool check_ssid_pattern(const char* ssid) {
     if (!ssid || strlen(ssid) == 0) return false;
-    for (int i = 0; i < NUM_SSID_PATTERNS; i++) {
-        if (strcasestr(ssid, wifi_ssid_patterns[i])) return true;
-    }
+    for (int i = 0; i < rt_ssid_count; i++) if (strcasestr(ssid, rt_ssid[i])) return true;
     return false;
 }
 
@@ -1534,9 +1674,7 @@ bool is_flock_ssid_format(const char* ssid) {
 
 bool check_device_name_pattern(const char* name) {
     if (!name || strlen(name) == 0) return false;
-    for (int i = 0; i < NUM_NAME_PATTERNS; i++) {
-        if (strcasestr(name, device_name_patterns[i])) return true;
-    }
+    for (int i = 0; i < rt_name_count; i++) if (strcasestr(name, rt_name[i])) return true;
     return false;
 }
 
@@ -1619,6 +1757,7 @@ static void methods_to_human(const char* methods, char* out, size_t out_len) {
         {"ssid_fmt",       "Flock SSID format"},
         {"wildcard_probe",    "Wildcard probe (Flock sig)"},
         {"wildcard_probe_t2", "Wildcard probe (Tier 2 OUI)"},
+        {"test_flck_cve",     "CVE-2025-59409 probe"},
         {"penguin_num",    "Penguin name"},
         {"name",           "Known name"},
         {"mac_t1",         "Known MAC"},
@@ -2168,7 +2307,7 @@ static void export_restore_promiscuous() {
 
     // Reinitialize NimBLE while WiFi is off (maximum heap available)
     NimBLEDevice::init("");
-    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    NimBLEDevice::setPower(BLE_TX_POWER);
     pBLEScan = NimBLEDevice::getScan();
     if (pBLEScan) {
         pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
@@ -3461,6 +3600,28 @@ static void feed_commit_pending() {
     xSemaphoreGiveRecursive(dataMutex);
 }
 
+// Force a feed entry immediately, bypassing the strongest-pending throttle.
+// Used for confirmed detections (esp. 5 GHz from the C5, which arrive once per
+// 30 s and would otherwise lose the per-window candidate competition).
+static void feed_force_push(const char* mac, const char* name, int rssi,
+                            int proto, bool is_flock) {
+    if (!mac || mac[0] == '\0') return;
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!feed_recently_pushed(mac)) {              // honor the 30 s dedup
+        feed_head = (feed_head + 1) % FEED_SIZE;
+        FeedEntry& fe = feed_entries[feed_head];
+        strncpy(fe.mac, mac, 17); fe.mac[17] = '\0';
+        strncpy(fe.name, (name && name[0]) ? name : "Hidden", sizeof(fe.name) - 1);
+        fe.name[sizeof(fe.name) - 1] = '\0';
+        fe.rssi      = (int8_t)rssi;
+        fe.proto     = (uint8_t)proto;
+        fe.is_flock  = is_flock;
+        fe.timestamp = millis();
+        if (feed_count < FEED_SIZE) feed_count++;
+    }
+    xSemaphoreGiveRecursive(dataMutex);
+}
+
 void add_blip(uint16_t blip_color, int rssi) {
     (void)blip_color; (void)rssi;
     last_blip_time = millis();
@@ -3673,7 +3834,7 @@ void add_to_capture_history(const char* type, const char* mac, const char* name,
 void log_detection(const char* type, const char* proto, int rssi, const char* mac,
                    const char* name, int channel, int tx_power,
                    const char* extra_data, const char* detection_method,
-                   int confidence, int seq_num) {
+                   int confidence, int seq_num, uint32_t epoch_hint = 0) {
     unsigned long now_ms = millis();
     char current_time[9];
     format_time_buf((now_ms - session_start_time) / 1000, current_time, sizeof(current_time));
@@ -3693,6 +3854,13 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         } else {
             Serial.println("[MUTEX] log_detection: GPS epoch window timeout");
         }
+    }
+
+    // 5 GHz hits arrive from the time-synced C5 with their own detection epoch.
+    // Use it only when our own GPS epoch is unavailable — live GPS stays authoritative.
+    if (!ts_is_gps && epoch_hint > 0) {
+        ts_epoch  = epoch_hint;
+        ts_is_gps = true;        // drives the datestamp derivation below
     }
 
     // Brief window 2: is_new check, counters, history, LED
@@ -4036,11 +4204,8 @@ static WifiEvent wifi_event_queue[WIFI_EVENT_QUEUE_SIZE];
 // Written only from the WiFi promiscuous callback (single task context on Core 0).
 static volatile uint32_t wifi_eq_write_idx = 0;
 static uint8_t           wifi_eq_read_idx  = 0;
-<<<<<<< HEAD
 static volatile uint32_t wifi_pkt_enqueued = 0;
 static volatile uint32_t wifi_pkt_dropped  = 0;
-=======
->>>>>>> 588f71f637d88b87d7903e9050b763bba1218073
 
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     if (!scanner_ready) return;
@@ -4070,14 +4235,10 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     // previous "next.ready" gate wasted a slot and capped capacity at 7
     // when the consumer was even one step behind.
     uint32_t cur_idx = __atomic_load_n(&wifi_eq_write_idx, __ATOMIC_RELAXED);
-<<<<<<< HEAD
     if (__atomic_load_n(&wifi_event_queue[cur_idx].ready, __ATOMIC_ACQUIRE)) {
         __atomic_fetch_add(&wifi_pkt_dropped, 1u, __ATOMIC_RELAXED);
         return;
     }
-=======
-    if (__atomic_load_n(&wifi_event_queue[cur_idx].ready, __ATOMIC_ACQUIRE)) return;
->>>>>>> 588f71f637d88b87d7903e9050b763bba1218073
     uint32_t next = (cur_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
 
     WifiEvent* ev = &wifi_event_queue[cur_idx];
@@ -4112,10 +4273,7 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     ev->vendor_oui_count = 0;
 
     __atomic_store_n(&ev->ready, 1u, __ATOMIC_RELEASE);
-<<<<<<< HEAD
     __atomic_fetch_add(&wifi_pkt_enqueued, 1u, __ATOMIC_RELAXED);
-=======
->>>>>>> 588f71f637d88b87d7903e9050b763bba1218073
     __atomic_store_n(&wifi_eq_write_idx, next, __ATOMIC_RELAXED);
 }
 
@@ -4219,7 +4377,7 @@ void process_wifi_event_queue() {
         // Flock device with a randomized MAC can still be detected via SSID.
         // BLE handles this via addr_type; WiFi needs an explicit bit check.
         bool is_random_mac = (local.mac[0] & 0x02) != 0;
-        int  mac_score     = is_random_mac ? 0 : check_mac_prefix_tiered(local.mac);
+        int  mac_score     = is_random_mac ? 0 : check_mac_prefix(local.mac);
 
         char mac_str[18];
         snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -4288,6 +4446,21 @@ void process_wifi_event_queue() {
             }
         }
 
+        // ── Cross-channel wildcard-probe behavioral tracker ──
+        // Track every wildcard probe regardless of OUI — once a MAC has hopped
+        // >= WILDCARD_MIN_CHANNELS distinct channels within WILDCARD_WINDOW_MS
+        // it is flagged as behaviorally confirmed.  For unknown-OUI devices this
+        // does NOT add confidence (avoids alarming on phones); it only emits a
+        // serial candidate line so the operator can curate the OUI list later.
+        // Known-OUI devices are already scored above; this only adds logging.
+        if (local.is_probe_req && strlen(local.ssid) == 0) {
+            bool wc_confirmed = wildcard_probe_observe(local.mac, local.channel);
+            if (wc_confirmed && mac_score == 0) {
+                Serial.printf("WILDCARD-CANDIDATE OUI %02x:%02x:%02x RSSI %d\n",
+                              local.mac[0], local.mac[1], local.mac[2], local.rssi);
+            }
+        }
+
         if (confidence > 0 && local.rssi > -50) confidence += SCORE_BONUS_RSSI;
 
         const char* name_str       = (strlen(local.ssid) > 0) ? local.ssid : "Hidden";
@@ -4304,7 +4477,7 @@ void process_wifi_event_queue() {
             bool addr1_broadcast = (local.addr1[0] == 0xFF && local.addr1[1] == 0xFF);
 
             if (!addr1_multicast && !addr1_random && !addr1_broadcast) {
-                int addr1_mac_score = check_mac_prefix_tiered(local.addr1);
+                int addr1_mac_score = check_mac_prefix(local.addr1);
                 if (addr1_mac_score > 0 && mac_score == 0) {
                     // addr1 matched but addr2 didn't — sleeping-device hit.
                     if (addr1_mac_score == 1) {
@@ -4431,7 +4604,7 @@ static void ble_worker_task(void* pvParameters) {
 
         bool got_penguin_name = false;
 
-        int mac_score = check_mac_prefix_tiered(ev->mac);
+        int mac_score = check_mac_prefix(ev->mac);
 
         char dev_name_char[65];
         strncpy(dev_name_char, ev->dev_name, 64);
@@ -4513,6 +4686,13 @@ static void ble_worker_task(void* pvParameters) {
             }
         }
         if (confidence > 0 && ev->rssi > -50) confidence += SCORE_BONUS_RSSI;
+
+        // Advertised TX power: fixed infrastructure often emits at higher TX
+        // power than a phone. Corroborator only — never trips alarm alone.
+        if (ev->have_tx_power && ev->tx_power >= TX_POWER_MIN_DBM) {
+            confidence += CONF_BONUS_TX_POWER;
+            strlcat(methods, "tx_pwr ", sizeof(methods));
+        }
 
         char mac_string[18];
         snprintf(mac_string, sizeof(mac_string), "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -4634,43 +4814,30 @@ void ScannerLoopTask(void* pvParameters) {
             }
         }
 
-        unsigned long base_interval = low_power_mode ? 6000UL : BLE_SCAN_INTERVAL;
-        unsigned long ble_interval = ((long)(now - lock_until) < 0)
-            ? BLE_SCAN_INTERVAL_LOCK
-            : base_interval;
-
         bool scanning = pBLEScan ? pBLEScan->isScanning() : false;
 
         // Hang detection: if isScanning() has been true for more than 2x the
         // configured scan duration plus 3s headroom, the NimBLE stack has
-        // wedged. Force-stop and clear so the next branch can restart cleanly.
+        // wedged. Force-stop so the next iteration can restart cleanly.
         const unsigned long SCAN_HANG_LIMIT_MS =
             (unsigned long)(BLE_SCAN_DURATION * 2000UL + 3000UL);
         if (scanning && pBLEScan && scan_start_ms > 0 &&
             (now - scan_start_ms) > SCAN_HANG_LIMIT_MS) {
             Serial.println("[BLE] Scan hang detected — forcing stop");
             pBLEScan->stop();
-            pBLEScan->clearResults();
             scanning = false;
             scan_start_ms = 0;
-            last_ble_scan = now;  // delay next start by full interval
         }
 
-        if (pBLEScan && millis() - last_ble_scan >= ble_interval) {
-            if (!scanning) {
-                bool active = low_power_mode ? false : (ble_scan_cycle % 3 == 0);
-                pBLEScan->setActiveScan(active);
-                pBLEScan->start(BLE_SCAN_DURATION, false);
-                scan_start_ms = millis();
-                last_ble_scan = millis();
-                ble_scan_cycle++;
-                scanning = true;  // we just started
-            }
-        }
-        if (pBLEScan && !scanning &&
-            (millis() - last_ble_scan > (unsigned long)(BLE_SCAN_DURATION * 1000 + 500))) {
-            pBLEScan->clearResults();
-            scan_start_ms = 0;  // clear so a stale value doesn't trip hang check
+        // BLE: keep sessions running back-to-back. Each session resets the
+        // duplicate filter → every device is re-reported every ~BLE_SCAN_DURATION s
+        // (preserves RSSI-trend resampling) with near-zero idle gap.
+        if (pBLEScan && !scanning) {
+            bool active = low_power_mode ? false : (ble_scan_cycle % 3 == 0);
+            pBLEScan->setActiveScan(active);
+            pBLEScan->start(BLE_SCAN_DURATION, false);
+            scan_start_ms = millis();
+            ble_scan_cycle++;
         }
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
@@ -9808,9 +9975,11 @@ static void apply_ble_scan_params() {
         pBLEScan->setInterval(200);   // 200 × 0.625ms = 125ms
         pBLEScan->setWindow(100);     // 100 × 0.625ms = 62.5ms
     } else {
-        // Full duty cycle: 60ms interval = window. Maximum detection rate.
-        pBLEScan->setInterval(97);
-        pBLEScan->setWindow(97);
+        // Window MUST be < interval or coexistence can never schedule WiFi RX.
+        // 60 ms listen per 100 ms = ~60% BLE duty, leaving ~40% for promiscuous.
+        // Flock/Raven advertise often enough to still be caught within 1-2 intervals.
+        pBLEScan->setInterval(160);   // 160 × 0.625 ms = 100 ms
+        pBLEScan->setWindow(96);      // 96 × 0.625 ms  = 60 ms
     }
 }
 
@@ -9871,6 +10040,52 @@ void c5_link_end() {
     Serial.println("[C5] link down");
 }
 
+static unsigned long c5_last_time_push_ms     = 0;
+static bool          c5_was_present_for_sync  = false;
+static const unsigned long C5_TIME_PUSH_INTERVAL_MS = 60000UL;
+
+static void c5_push_time() {
+    if (!c5_link_started) return;
+    uint32_t epoch = 0;
+    if (take_data_mutex()) {
+        if (gps.date.isValid() && gps.time.isValid() &&
+            gps.date.year() >= 2020 && gps.date.year() <= 2099) {
+            epoch = utc_to_epoch(gps.date.year(), gps.date.month(), gps.date.day(),
+                                 gps.time.hour(), gps.time.minute(), gps.time.second());
+        }
+        give_data_mutex();
+    }
+    if (epoch > 0) SerialC5.printf("T|%lu\n", (unsigned long)epoch);
+}
+
+static void c5_push_signatures() {
+    if (!c5_link_started) return;
+    SerialC5.printf("SB\n");
+    int oui_sent = 0, ssid_sent = 0;
+    for (int i = 0; i < rt_oui_count; i++) {
+        SerialC5.printf("SO|%s|%d\n", rt_oui[i].prefix, (int)rt_oui[i].tier);
+        oui_sent++;
+    }
+    for (int i = 0; i < rt_ssid_count; i++) { SerialC5.printf("SS|%s\n", rt_ssid[i]); ssid_sent++; }
+    SerialC5.printf("SE|%d|%d\n", oui_sent, ssid_sent);
+    Serial.printf("[C5] pushed signatures: OUI=%d SSID=%d\n", oui_sent, ssid_sent);
+}
+
+static void service_c5_link() {
+    if (!c5_enabled || !c5_link_started) { c5_was_present_for_sync = false; return; }
+    bool present = c5_is_present();
+    if (present && !c5_was_present_for_sync) {
+        c5_push_signatures();
+        c5_push_time();
+        c5_last_time_push_ms = millis();
+    }
+    c5_was_present_for_sync = present;
+    if (present && (millis() - c5_last_time_push_ms) >= C5_TIME_PUSH_INTERVAL_MS) {
+        c5_push_time();
+        c5_last_time_push_ms = millis();
+    }
+}
+
 // Split a '|'-delimited line in place; fields[] point into buf. The final
 // field (methods) may legitimately contain spaces.
 static int c5_split(char* buf, char* fields[], int max_fields) {
@@ -9896,6 +10111,16 @@ static void c5_handle_line(char* line) {
         return;
     }
 
+    if (f[0][0] == 'F' && nf >= 5) {     // F|mac|name|rssi|ch — ambient 5 GHz
+        c5_last_msg_ms = millis();
+        const char* mac  = f[1];
+        const char* name = f[2];
+        int         rssi = atoi(f[3]);
+        if (mac[0] && !is_mac_whitelisted(mac))
+            feed_push_candidate(mac, name[0] ? name : "Hidden", rssi, 0, false);
+        return;
+    }
+
     if (f[0][0] == 'D' && nf >= 7) {      // D|mac|name|rssi|ch|conf|methods
         c5_last_msg_ms = millis();
 
@@ -9905,17 +10130,20 @@ static void c5_handle_line(char* line) {
         int         channel = atoi(f[4]);
         int         conf    = atoi(f[5]);
         const char* methods = f[6];
+        uint32_t    c5_epoch = (nf >= 8) ? (uint32_t)strtoul(f[7], NULL, 10) : 0;
 
         if (conf < 0)   conf = 0;
         if (conf > 100) conf = 100;
         if (mac[0] == '\0')          return;
         if (is_mac_whitelisted(mac)) return;       // honor the user's whitelist
 
+        feed_force_push(mac, name, rssi, 0, true);   // 5 GHz hit into the live feed
+
         // Same pipeline as a 2.4 GHz hit. proto "WIFI" keeps the alarm/visual
         // routing identical; the 5 GHz channel (36-165) marks the band, and
         // extra_data flags the source. GPS tagging happens inside log_detection.
         log_detection("FLOCK_5G", "WIFI", rssi, mac, name,
-                      channel, 0, "5GHz radio", methods, conf, 0);
+                      channel, 0, "5GHz radio", methods, conf, 0, c5_epoch);
 
         // The one thing log_detection() doesn't do itself: arm the buzzer.
         // Mirror the 2.4 GHz call site so a strong 5 GHz hit sounds the alarm.
@@ -10159,6 +10387,12 @@ void setup() {
         }
     }
 
+    signatures_seed_defaults();
+    signatures_load_from_sd();
+    Serial.print(F("[SIG] MAC:")); Serial.print(rt_oui_count);
+    Serial.print(F(" SSID:"));    Serial.print(rt_ssid_count);
+    Serial.print(F(" BLE:"));     Serial.println(rt_name_count);
+
     delay(100);
     // NMEA sentences max ~82 chars — 1024-byte default RX is 2× too big.
     // setRxBufferSize must be called BEFORE begin() to take effect.
@@ -10233,8 +10467,6 @@ void setup() {
     }
     // Apply persisted settings that require hardware calls after load
     if (night_mode)     apply_color_palette();
-    if (low_power_mode)    setCpuFrequencyMhz(80);
-    if (turbo_mode_active) setCpuFrequencyMhz(240);
     if (stealth_mode)      M5Cardputer.Display.setBrightness(5);
     if (is_muted)       M5Cardputer.Speaker.setVolume(0);
     if (c5_enabled)        c5_link_begin();   // bring up 5 GHz C5 link if enabled
@@ -10259,18 +10491,39 @@ void setup() {
     }
     session_start_time = millis();
 
+    // Set steady-state CPU clock before radio bring-up so WiFi and BLE init
+    // don't stack their current spikes on top of a 240 MHz draw.
+    if (turbo_mode_active)
+        setCpuFrequencyMhz(240);
+    else if (low_power_mode)
+        setCpuFrequencyMhz(80);
+    else
+        setCpuFrequencyMhz(160);
+    Serial.printf("[BOOT] CPU %u MHz before radio init\n", getCpuFrequencyMhz());
+
     // WiFi promiscuous mode — complete before scanner screen appears
-    WiFi.disconnect(); delay(WIFI_MODE_SETTLE_MEDIUM_MS); esp_wifi_set_ps(WIFI_PS_NONE);
-    wifi_promiscuous_filter_t filt; filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
-    esp_wifi_set_promiscuous_filter(&filt); esp_wifi_set_promiscuous(true);
-    esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
-    esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(WIFI_MODE_SETTLE_MEDIUM_MS);
+    WiFi.mode(WIFI_STA);          // re-assert STA HERE so the driver is guaranteed
+    WiFi.disconnect();            // started at the moment we enable promiscuous
+    delay(WIFI_MODE_SETTLE_MEDIUM_MS);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    wifi_promiscuous_filter_t filt;
+    filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+
+    esp_err_t pf = esp_wifi_set_promiscuous_filter(&filt);
+    esp_err_t pr = esp_wifi_set_promiscuous(true);
+    esp_err_t cb = esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
+    esp_err_t ch = esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+    Serial.printf("[WIFI] filter=%d promisc=%d cb=%d channel=%d (0=OK)\n",
+                  (int)pf, (int)pr, (int)cb, (int)ch);
+
+    delay(WIFI_MODE_SETTLE_MEDIUM_MS);
     Serial.printf("[BOOT] Free heap after WiFi promisc: %u\n",
                   (unsigned)esp_get_free_heap_size());
     boot_animate(88, "starting sniffer");
 
     // NimBLE — complete before scanner screen appears
-    NimBLEDevice::init(""); NimBLEDevice::setMTU(23); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    NimBLEDevice::init(""); NimBLEDevice::setMTU(23); NimBLEDevice::setPower(BLE_TX_POWER);
     Serial.printf("[BOOT] Free heap after NimBLE init: %u\n",
                   (unsigned)esp_get_free_heap_size());
     pBLEScan = NimBLEDevice::getScan();
@@ -10297,6 +10550,11 @@ void setup() {
 
     // WDT was already initialized early in setup(); each watched task
     // self-subscribes via esp_task_wdt_add(NULL) inside its loop.
+
+    // Ungate the radios NOW, before the feed gate + title card, so the
+    // WiFi/BLE callbacks capture in the background while the title card is up.
+    // The scanner is then already populated and live the instant it's revealed.
+    scanner_ready = true;
 
     boot_animate(100, "ready");
     delay(400);
@@ -10366,10 +10624,28 @@ void setup() {
             }
         }
 
+        // Boot chime — plays over the title card, not after the reveal.
+        // stop() flushes stale I2S DMA (same trick AlarmTask uses) instead of
+        // the end()/begin() cycle that caused the DC-transient "pop". Higher
+        // pitch + volume so the small speaker actually reproduces it.
+        if (!stealth_mode) {
+            M5Cardputer.Speaker.stop();
+            delay(10);
+            M5Cardputer.Speaker.setVolume(150);
+            M5Cardputer.Speaker.tone(640, 160); delay(190);
+            M5Cardputer.Speaker.tone(480, 160); delay(190);
+            M5Cardputer.Speaker.tone(540, 220); delay(260);
+            M5Cardputer.Speaker.stop();
+        }
+        M5Cardputer.Speaker.setVolume(is_muted ? 0 : current_volume);
+
         // Phase 3: Hold on title card (~2 seconds)
         {
             unsigned long hold_start = millis();
             while (millis() - hold_start < 2000) {
+                M5Cardputer.update();
+                process_wifi_event_queue();
+                feed_commit_pending();
                 spr.fillSprite(BG_COLOR);
                 draw_title_card_overlay(1.0f);
                 spr.pushSprite(0, 0);
@@ -10384,6 +10660,9 @@ void setup() {
             unsigned long dissolve_ms = 1000;
 
             while (millis() - dissolve_start < dissolve_ms) {
+                M5Cardputer.update();
+                process_wifi_event_queue();
+                feed_commit_pending();
                 float alpha = 1.0f - (float)(millis() - dissolve_start) / (float)dissolve_ms;
 
                 draw_current_screen();
@@ -10407,32 +10686,6 @@ void setup() {
         render_frame();
     }
 
-    // Boot chime — plays after the scanner is visible. Vintage descending
-    // tone settles on a middle pitch for a 70s-terminal feel.
-    if (!stealth_mode) {
-        M5Cardputer.Speaker.end();
-        delay(50);
-        M5Cardputer.Speaker.begin();
-        delay(50);
-        M5Cardputer.Speaker.setVolume(25);
-        M5Cardputer.Speaker.setChannelVolume(0, 25);
-        delay(100);
-        M5Cardputer.Speaker.tone(240, 180); delay(220);
-        M5Cardputer.Speaker.tone(180, 180); delay(220);
-        M5Cardputer.Speaker.tone(200, 260); delay(300);
-        M5Cardputer.Speaker.stop();
-    }
-    M5Cardputer.Speaker.setVolume(is_muted ? 0 : current_volume);
-
-    // Set CPU frequency based on persisted mode. Boot and radio init ran at
-    // 240MHz; now drop to the appropriate steady-state clock.
-    if (turbo_mode_active)
-        setCpuFrequencyMhz(240);
-    else if (low_power_mode)
-        setCpuFrequencyMhz(80);
-    else
-        setCpuFrequencyMhz(160);
-
     // Ungate callbacks — both WiFi and BLE were discarding packets until now.
     scanner_ready = true;
     Serial.println("[BOOT] Scanner ready — promiscuous callbacks enabled");
@@ -10451,6 +10704,7 @@ static void service_battery_warnings(int32_t loop_mv) {
 
     static int32_t last_battery_warning_mv = 9999;
     static unsigned long last_battery_warn_toast_ms = 0;
+    static bool auto_conserved = false;
     unsigned long batt_now = millis();
 
     // Initial crossing-detection (unchanged behavior).
@@ -10458,6 +10712,17 @@ static void service_battery_warnings(int32_t loop_mv) {
         set_toast_direct("BATT CRITICAL 3.5V", TOAST_WARNING, false);
         last_battery_warning_mv = 3500;
         last_battery_warn_toast_ms = batt_now;
+        // Auto-conserve: drop to low-power mode once to stretch remaining
+        // charge and shrink the peak that would otherwise trip a brownout.
+        if (!auto_conserved && !low_power_mode) {
+            auto_conserved = true;
+            turbo_mode_active = false;
+            low_power_mode = true;
+            setCpuFrequencyMhz(80);
+            apply_ble_scan_params();      // applies 50%-duty BLE params
+            schedule_persist();           // flush state now in case of imminent cutoff
+            set_toast_direct("LOW BATT - CONSERVING", TOAST_WARNING, false);
+        }
     } else if (loop_mv <= 3700 && last_battery_warning_mv > 3700) {
         set_toast_direct("BATT LOW 3.7V", TOAST_WARNING, false);
         last_battery_warning_mv = 3700;
@@ -10465,8 +10730,11 @@ static void service_battery_warnings(int32_t loop_mv) {
     } else if (last_battery_warning_mv < 9999
                && loop_mv >= last_battery_warning_mv + 100) {
         // Voltage recovered (charger plugged in, or rebound from load drop).
+        // Clear the latch so it can re-arm on a future dip; do NOT auto-restore
+        // low-power mode — the user can turn it off from the menu if plugged in.
         last_battery_warning_mv = 9999;
         last_battery_warn_toast_ms = 0;
+        auto_conserved = false;
     }
 
     // Periodic re-warn while below a threshold.
@@ -10634,7 +10902,6 @@ static void service_heap_health() {
                           (unsigned)largest_block, (unsigned)free_heap);
         }
     }
-<<<<<<< HEAD
     // Diagnostic: free >> 15000 but largest near/below it -> FRAGMENTATION
     //             free itself dropping toward 15000             -> EXHAUSTION
     static size_t min_largest_seen = 999999;
@@ -10651,8 +10918,6 @@ static void service_heap_health() {
         Serial.printf("[LOADLOG] enq=%u drop=%u drop_pct=%u free=%u largest=%u\n",
                       enq, drop, pct, (unsigned)free_heap, (unsigned)largest_block);
     }
-=======
->>>>>>> 588f71f637d88b87d7903e9050b763bba1218073
 }
 
 static void service_ambient_mode() {
@@ -10788,7 +11053,7 @@ static void service_ble_restart() {
         NimBLEDevice::deinit(true);
         delay(100);
         NimBLEDevice::init("");
-        NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+        NimBLEDevice::setPower(BLE_TX_POWER);
         pBLEScan = NimBLEDevice::getScan();
         pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
         pBLEScan->setActiveScan(false);
@@ -11690,6 +11955,7 @@ void loop() {
 
     process_wifi_event_queue();
     process_c5_serial();        // drain 5 GHz hits from the C5 (self-guards when link is off)
+    service_c5_link();          // sig + time push, presence-edge driven
     feed_commit_pending();
     update_channel_histogram();
 
