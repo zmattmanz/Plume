@@ -162,8 +162,51 @@ static char wifi_config_pass_buf[65] = "";
 static int  wifi_config_cursor = 0;        // cursor position in active field
 static unsigned long wifi_config_open_ms = 0;
 
+// ── Menu row table — single source of truth for BOTH layout and navigation ──
+// type: 0 = section header, 1 = selectable item, 2 = gap.
+// idx must match the case labels in handle_menu_select().
+struct MRow { int type; int idx; const char* text; };
+static const MRow MENU_ROWS[] = {
+    {0, -1, "SCREENS"},
+    {1,  0, "Scanner"},
+    {1,  1, "Signal"},
+    {1,  2, "Detections"},
+    {1,  3, "GPS"},
+    {1,  4, "Stats"},
+    {2, -1, ""},
+    {0, -1, "SETTINGS"},
+    {1,  5, "Night Mode"},
+    {1,  6, "Low Power"},
+    {1,  7, "Mute Beeps"},
+    {1,  8, "Turbo Mode"},
+    {1, 12, "5GHz Radio"},
+    {2, -1, ""},
+    {0, -1, "ACTIONS"},
+    {1,  9, "WiFi Config"},
+    {1, 10, "Export Mode"},
+    {1, 11, "Clear All"},
+};
+static const int MENU_ROW_COUNT = sizeof(MENU_ROWS) / sizeof(MENU_ROWS[0]);
+
+static_assert(MENU_ROW_COUNT == 18, "MENU_ROWS changed — update this guard and verify handle_menu_select() cases match");
+
+static int menu_next_idx(int cur, int dir) {
+    int pos = -1;
+    for (int i = 0; i < MENU_ROW_COUNT; i++)
+        if (MENU_ROWS[i].type == 1 && MENU_ROWS[i].idx == cur) { pos = i; break; }
+    if (pos < 0) {
+        for (int i = 0; i < MENU_ROW_COUNT; i++)
+            if (MENU_ROWS[i].type == 1) return MENU_ROWS[i].idx;
+        return cur;
+    }
+    for (int s = 1; s <= MENU_ROW_COUNT; s++) {
+        int i = (((pos + dir * s) % MENU_ROW_COUNT) + MENU_ROW_COUNT) % MENU_ROW_COUNT;
+        if (MENU_ROWS[i].type == 1) return MENU_ROWS[i].idx;
+    }
+    return cur;
+}
+
 // ── Menu state ──
-static const int MENU_ITEM_COUNT = 12;
 static int  menu_selected = 0;  // bridged into handle_menu_select()
 
 // ── Fullscreen menu state ──
@@ -1402,7 +1445,11 @@ int32_t get_filtered_voltage() {
     // discharge sag model does not apply — adding it would corrupt the
     // reading. We also converge faster so the display tracks the rising
     // cell instead of crawling behind the discharge-tuned filter.
-    bool    charging = M5Cardputer.Power.isCharging();
+    // isCharging(): 0=discharging, 1=charging, 2=charge_unknown.
+    // The Cardputer has no charge-status line, so it always returns 2 (unknown).
+    // Treat ONLY a definite "charging" (1) as charging; unknown/discharging apply
+    // the load-sag correction. (== 1 used directly to avoid library enum-name drift.)
+    bool    charging = (M5Cardputer.Power.isCharging() == 1);
     int32_t sag      = charging ? 0 : current_load_sag_mv;
     float   alpha    = charging ? EMA_ALPHA_CHARGING : EMA_ALPHA;
 
@@ -5886,31 +5933,12 @@ static void draw_menu_overlay() {
     const int SECT_H   = 15;
     const int GAP_H    = 5;
 
-    // Row map: type 0=section header, 1=item, 2=gap
-    struct MRow { int type; int idx; const char* text; };
-    static const MRow mrows[] = {
-        {0, -1, "SCREENS"},
-        {1,  0, "Scanner"},
-        {1,  1, "Signal"},
-        {1,  2, "Detections"},
-        {1,  3, "GPS"},
-        {1,  4, "Stats"},
-        {2, -1, ""},
-        {0, -1, "SETTINGS"},
-        {1,  5, "Night Mode"},
-        {1,  7, "Mute Beeps"},
-        {1,  6, "Low Power"},
-        {1,  8, "Turbo Mode"},
-        {2, -1, ""},
-        {0, -1, "ACTIONS"},
-        {1,  9, "WiFi Config"},
-        {1, 10, "Export Mode"},
-        {1, 11, "Clear All"},
-    };
-    const int NROWS = 17;
+    // Layout + navigation share one table (MENU_ROWS, file scope).
+    const MRow* mrows = MENU_ROWS;
+    const int   NROWS = MENU_ROW_COUNT;
 
     // Compute virtual y for each row
-    int virt_y[17];
+    int virt_y[MENU_ROW_COUNT];
     int cy = 0;
     for (int i = 0; i < NROWS; i++) {
         virt_y[i] = cy;
@@ -11236,10 +11264,10 @@ static void handle_keyboard_input() {
             // ── Menu navigation — swallow all keys while menu is open ──
             if (menu_open) {
                 if (IS_KEY_UP(c)) {
-                    menu_selected = (menu_selected - 1 + MENU_ITEM_COUNT) % MENU_ITEM_COUNT;
+                    menu_selected = menu_next_idx(menu_selected, -1);
                     menu_click();
                 } else if (IS_KEY_DOWN(c)) {
-                    menu_selected = (menu_selected + 1) % MENU_ITEM_COUNT;
+                    menu_selected = menu_next_idx(menu_selected, +1);
                     menu_click();
                 } else if (c == '\n' || c == '\r') {
                     menu_open = false;
