@@ -150,8 +150,13 @@ static const uint8_t AMBIENT_BRIGHTNESS = 40;
 // under charge-mode's own near-zero load; EXIT sits well above ENTER so the
 // radios' load sag on resume can't immediately drop back under the brown-out
 // floor and re-trigger the loop.
-#define CHARGE_MODE_ENTER_MV  3400          // boot below this -> charge mode (anti-bootloop)
-#define CHARGE_MODE_EXIT_MV   3650          // hold above this -> resume the app
+// ENTER is the *resting* (unloaded) floor below which we don't risk radio init.
+// It can't predict a load-induced brownout on its own, so the boot gate ALSO
+// enters on a brownout reset reason (the real loop-breaker). EXIT sits near the
+// 3.72V level the full app was observed to boot+run at, with margin so the
+// radios' load sag on resume can't drop straight back under the brownout floor.
+#define CHARGE_MODE_ENTER_MV  3550          // boot below this -> charge mode (anti-bootloop)
+#define CHARGE_MODE_EXIT_MV   3750          // hold above this -> resume the app
 #define CHARGE_MODE_MAGIC     0x50C0FFEEUL  // "enter charge mode on next boot" sentinel
 RTC_DATA_ATTR uint32_t charge_mode_request = 0;  // survives ESP.restart(), cleared on power loss
 static bool ambient_mode = false;
@@ -1576,9 +1581,15 @@ void run_charge_mode() {
 
     lcd.fillScreen(COL_BG);
 
+    // The battery ADC on this board is noisy, and while charging on the shared
+    // rail the voltage genuinely ripples (charger behaviour + the 500ms redraw's
+    // own current pulse). Smooth it with an EMA (~2s time constant at a=0.2 /
+    // 500ms) so the number is stable and the resume decision can't be tripped by
+    // a single spike.
+    float    ema_mv           = 0.0f;
     uint32_t exit_stable_since = 0;   // 0 = not currently above EXIT threshold
-    int32_t  last_mv  = -1;
-    int      last_pct = -1;
+    int32_t  last_shown_mv    = -1;
+    int      last_pct         = -1;
 
     for (;;) {
         M5Cardputer.update();
@@ -1586,11 +1597,14 @@ void run_charge_mode() {
         // Any keypress = user override, "start the app now".
         if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) return;
 
-        int32_t mv  = charge_mode_read_mv();
+        int32_t raw = charge_mode_read_mv();
+        ema_mv = (ema_mv == 0.0f) ? (float)raw : (0.2f * (float)raw + 0.8f * ema_mv);
+        int32_t mv  = (int32_t)ema_mv;
         int     pct = voltage_to_percent(mv);
 
-        // Auto-resume once the cell HOLDS above EXIT for a sustained window, so a
-        // momentary spike doesn't bounce us into a brown-out the instant radios load it.
+        // Auto-resume once the SMOOTHED cell voltage HOLDS above EXIT for a
+        // sustained window, so ripple can't bounce us into a brown-out the
+        // instant the radios load the rail on resume.
         if (mv >= CHARGE_MODE_EXIT_MV) {
             if (exit_stable_since == 0)                         exit_stable_since = millis();
             else if (millis() - exit_stable_since >= 4000)      return;
@@ -1598,8 +1612,9 @@ void run_charge_mode() {
             exit_stable_since = 0;
         }
 
-        if (mv != last_mv || pct != last_pct) {   // redraw only on change (no flicker)
-            last_mv = mv; last_pct = pct;
+        int32_t shown_mv = (mv / 10) * 10;   // 10mV display resolution
+        if (shown_mv != last_shown_mv || pct != last_pct) {   // redraw only on visible change
+            last_shown_mv = shown_mv; last_pct = pct;
             uint16_t accent = (mv >= CHARGE_MODE_EXIT_MV) ? COL_GOOD : COL_LOW;
             lcd.fillScreen(COL_BG);
 
@@ -10275,13 +10290,20 @@ void setup() {
     // pressed. This is what breaks the low-battery boot loop: we never reach
     // radio init on a cell that can't power it.
     {
-        int32_t boot_mv = charge_mode_read_mv();
-        bool requested  = (charge_mode_request == CHARGE_MODE_MAGIC);
-        Serial.printf("[BOOT] battery=%dmV, charge_mode_request=%s\n",
-                      (int)boot_mv, requested ? "yes" : "no");
-        if (requested || boot_mv < CHARGE_MODE_ENTER_MV) {
-            Serial.printf("[BOOT] entering Charge Mode (%s)\n",
-                          requested ? "user request" : "battery below entry floor");
+        int32_t boot_mv   = charge_mode_read_mv();
+        bool    requested = (charge_mode_request == CHARGE_MODE_MAGIC);
+        // A brownout reset means the last boot's radio-init surge collapsed the
+        // rail. The resting reading here reads deceptively high (no load yet), so
+        // it alone won't stop the loop — but the reset reason will. Hold and
+        // charge instead of surging into the same brownout again.
+        bool    brownout  = (esp_reset_reason() == ESP_RST_BROWNOUT);
+        Serial.printf("[BOOT] battery=%dmV, charge_mode_request=%s, brownout=%s\n",
+                      (int)boot_mv, requested ? "yes" : "no", brownout ? "yes" : "no");
+        if (requested || brownout || boot_mv < CHARGE_MODE_ENTER_MV) {
+            const char* why = requested ? "user request"
+                            : brownout  ? "recovering from brownout"
+                                        : "battery below entry floor";
+            Serial.printf("[BOOT] entering Charge Mode (%s)\n", why);
             run_charge_mode();
             Serial.println("[BOOT] leaving Charge Mode -> normal boot");
         }
