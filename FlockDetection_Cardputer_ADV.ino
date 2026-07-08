@@ -266,6 +266,15 @@ static bool low_power_mode = false;
 static bool turbo_mode_active = false;
 static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
 
+// Effective backlight target. The Cardputer ADV has no software-controllable
+// charger (M5Unified maps it to pmic_adc — setChargeCurrent() is a no-op), so
+// the only way to stay charge-positive on USB is to cut load. The backlight is
+// the single largest continuous draw, so low-power mode forces it down to the
+// dim ambient level. stealth (5) is handled separately and is dimmer still.
+static inline uint8_t effective_brightness() {
+    return low_power_mode ? AMBIENT_BRIGHTNESS : BRIGHTNESS_LEVELS[brightness_level];
+}
+
 // RGB LED state — color cycles with C key, on/off with L when locator idle
 static uint8_t led_r = 77, led_g = 219, led_b = 194;  // default teal (matches HEADER_COLOR)
 static bool    led_breathing_on = true;
@@ -1401,7 +1410,7 @@ void LedTask(void* pv) {
             led_detect_active = false;
             bool export_on = (export_mode_active || export_connecting);
             bool show_led = !stealth_mode && !night_mode &&
-                            (export_on || (led_breathing_on && brightness_level >= 2));
+                            (export_on || (led_breathing_on && brightness_level >= 2 && !low_power_mode));
             if (show_led) {
                 float breath = anim_pulse(export_on ? UI_PULSE_MEDIUM : UI_PULSE_BREATHE);
                 float dim    = export_on ? (0.30f + breath * 0.55f) : (0.15f + breath * 0.35f);
@@ -6237,6 +6246,10 @@ static void set_turbo_mode(bool on) {
         if (low_power_mode) {
             low_power_mode = false;
             apply_ble_scan_params();
+            // Low-power dimmed the backlight; turbo means full performance, so
+            // bring it back up (unless stealth/ambient own it).
+            if (!stealth_mode && !ambient_mode)
+                M5Cardputer.Display.setBrightness(effective_brightness());
         }
         setCpuFrequencyMhz(240);
         set_toast_direct("TURBO ON", TOAST_SUCCESS);
@@ -6272,6 +6285,10 @@ void handle_menu_select() {
                 setCpuFrequencyMhz(160);
                 set_toast_direct("LOW POWER OFF", TOAST_NEUTRAL);
             }
+            // Apply the backlight change now (dim on, restore on off). Skip when
+            // stealth/ambient own the backlight so we don't fight them.
+            if (!stealth_mode && !ambient_mode)
+                M5Cardputer.Display.setBrightness(effective_brightness());
             apply_ble_scan_params();
             schedule_persist();
             screen_dirty = true;
@@ -10113,6 +10130,14 @@ void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
 
+    // Drop to the lowest clock for the brown-out-prone early boot. The ESP32-S3
+    // powers on at the board's full configured clock (typ. 240 MHz), so without
+    // this the CPU draws peak current through the whole pre-radio window (sprite,
+    // SD, GPS, LittleFS) — exactly where a depleted cell collapses (reset_reason
+    // 9 / BROWNOUT). 80 MHz is plenty for display+SD+GPS; the steady-state clock
+    // is set later, right before radio init.
+    setCpuFrequencyMhz(80);
+
     // PSRAM availability + heap snapshot. Total PSRAM = 0 means PSRAM
     // isn't enabled in the board config; setPsram(true) will silently fall
     // through to internal RAM and the sprite-fallback path will kick in.
@@ -10152,27 +10177,14 @@ void setup() {
     dataMutex = xSemaphoreCreateRecursiveMutex();
     sdMutex   = xSemaphoreCreateMutex();
 
-    // Create the draw sprite FIRST, before WiFi / BLE / LittleFS eat internal
-    // heap. Try PSRAM first (frees ~64KB of internal SRAM for the WiFi/BLE
-    // radio stacks); fall back to internal SRAM on boards without PSRAM
-    // configured. Hard-fail on total allocation failure.
-    spr.setColorDepth(16);
-    spr.setPsram(true);
-    void* sprite_buf = spr.createSprite(DISP_W, SPR_H);
-    if (!sprite_buf) {
-        Serial.println("[GFX] PSRAM sprite failed, falling back to internal");
-        spr.setPsram(false);
-        sprite_buf = spr.createSprite(DISP_W, SPR_H);
-    }
-    if (!sprite_buf) {
-        M5Cardputer.Display.fillScreen(lgfx::color565(255, 0, 0));
-        M5Cardputer.Display.setCursor(10, 10);
-        M5Cardputer.Display.print("SPRITE ALLOC FAIL");
-        while (1) delay(1000);
-    }
-    Serial.printf("[GFX] Sprite allocated in %s, free heap: %u\n",
-                  (ESP.getPsramSize() > 0 && (uint32_t)sprite_buf >= 0x3C000000) ? "PSRAM" : "internal",
-                  (unsigned)esp_get_free_heap_size());
+    // NOTE: the 54KB draw sprite is created LATER, after WiFi + BLE controller
+    // init (see the "arming scanner" stage below). This board is a no-PSRAM
+    // ESP32-S3FN8 (Total PSRAM: 0), so allocating the sprite first fragments
+    // internal RAM and starves the BLE controller of the contiguous DMA block
+    // it needs at init — the exact failure that crashed here with
+    // `assert failed: block_locate_free ... tlsf`. Radios claim their memory
+    // first from a clean heap; the sprite takes what remains. The boot
+    // animation draws straight to the LCD, so it needs no sprite yet.
 
     // LED: start dark. The breathing task is spawned at the very end of setup()
     // to avoid RMT/radio contention during WiFi + BLE init on core 0.
@@ -10190,7 +10202,11 @@ void setup() {
     {
         const int FADE_STEPS   = 16;
         const int FADE_STEP_MS = (int)UI_ANIM_NORMAL / FADE_STEPS;
-        const int target_b     = BRIGHTNESS_LEVELS[brightness_level];
+        // Keep the backlight dim through the whole risky boot phase (SD, GPS,
+        // LittleFS, radio init) — the backlight is the largest early load and
+        // this is where a depleted cell browns out. The title-card reveal at
+        // the end of setup() ramps to full brightness, after the surge is over.
+        const int target_b     = AMBIENT_BRIGHTNESS;
         for (int i = 0; i <= FADE_STEPS; i++) {
             int b = (target_b * i) / FADE_STEPS;
             M5Cardputer.Display.setBrightness(b);
@@ -10350,8 +10366,10 @@ void setup() {
     }
     boot_animate(58 + random(0, 3), "calibrating battery");
 
-    setCpuFrequencyMhz(240);
-    boot_animate(62 + random(0, 3), "boosting CPU");
+    // Stay at the low boot clock — the BLE worker only blocks on a queue until
+    // the radio is brought up later, so 240 MHz here would just stack a CPU
+    // surge onto a charging cell and risk a boot-time brownout.
+    boot_animate(62 + random(0, 3), "queuing Bluetooth");
     ble_event_queue = xQueueCreate(BLE_POOL_SIZE, sizeof(uint8_t));
     xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 2752, NULL, 1, &BLEWorkerHandle, 1);
     boot_animate(68, "starting Bluetooth");
@@ -10471,6 +10489,31 @@ void setup() {
     // default cache can hit 10–20 KB in a busy RF environment for no benefit.
     pBLEScan->setMaxResults(0);
     last_ble_restart_ms = millis();
+
+    // ── Draw sprite allocated HERE, now that WiFi + BLE controllers already
+    // hold their contiguous internal RAM. On this no-PSRAM board the sprite
+    // takes whatever internal heap remains; the earlier ordering (sprite first)
+    // starved the BLE controller and crashed at init. createSprite still tries
+    // PSRAM first (a no-op with none present), then internal. First real sprite
+    // use is the title-card dissolve after setup(), so this is early enough.
+    spr.setColorDepth(16);
+    spr.setPsram(true);
+    void* sprite_buf = spr.createSprite(DISP_W, SPR_H);
+    if (!sprite_buf) {
+        Serial.println("[GFX] PSRAM sprite failed, falling back to internal");
+        spr.setPsram(false);
+        sprite_buf = spr.createSprite(DISP_W, SPR_H);
+    }
+    if (!sprite_buf) {
+        M5Cardputer.Display.fillScreen(lgfx::color565(255, 0, 0));
+        M5Cardputer.Display.setCursor(10, 10);
+        M5Cardputer.Display.print("SPRITE ALLOC FAIL");
+        while (1) delay(1000);
+    }
+    Serial.printf("[GFX] Sprite allocated in %s, free heap: %u\n",
+                  (ESP.getPsramSize() > 0 && (uint32_t)sprite_buf >= 0x3C000000) ? "PSRAM" : "internal",
+                  (unsigned)esp_get_free_heap_size());
+
     boot_animate(96, "arming scanner");
 
     // Tasks
@@ -10534,7 +10577,7 @@ void setup() {
 
     // ── Title card boot sequence ──
     {
-        int start_brightness = BRIGHTNESS_LEVELS[brightness_level];
+        int start_brightness = effective_brightness();
 
         // Phase 1: Fade out boot screen
         {
@@ -10655,6 +10698,8 @@ static void service_battery_warnings(int32_t loop_mv) {
             turbo_mode_active = false;
             low_power_mode = true;
             setCpuFrequencyMhz(80);
+            if (!stealth_mode && !ambient_mode)
+                M5Cardputer.Display.setBrightness(effective_brightness());
             apply_ble_scan_params();      // applies 50%-duty BLE params
             schedule_persist();           // flush state now in case of imminent cutoff
             set_toast_direct("LOW BATT - CONSERVING", TOAST_WARNING, false);
@@ -10868,7 +10913,7 @@ static void service_ambient_mode() {
     // Exit ambient if conditions change from non-input sources
     if (ambient_mode && (signal_active || export_mode_active || toast_active)) {
         ambient_mode = false;
-        M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+        M5Cardputer.Display.setBrightness(effective_brightness());
     }
 }
 
@@ -11136,7 +11181,7 @@ static void handle_keyboard_input() {
         screen_dirty = true;
         if (ambient_mode) {
             ambient_mode = false;
-            M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+            M5Cardputer.Display.setBrightness(effective_brightness());
             // Same I2S wake as the BtnA path.
             M5Cardputer.Speaker.stop();
         }
@@ -11593,7 +11638,7 @@ static void handle_keyboard_input() {
             else if (c == 'b') {
                 if (!stealth_mode) {
                     brightness_level = (brightness_level + 1) % 3;
-                    M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+                    M5Cardputer.Display.setBrightness(effective_brightness());
                     // Disable LED at dim levels, re-enable at full brightness
                     if (brightness_level < 2) {
                         led_breathing_on = false;
@@ -11603,7 +11648,7 @@ static void handle_keyboard_input() {
                     schedule_persist();
                 }
             }
-            else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(5); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); render_frame(); } schedule_persist(); }
+            else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(5); } else { M5Cardputer.Display.setBrightness(effective_brightness()); draw_current_screen(); render_frame(); } schedule_persist(); }
             else if (c == 'n') {
                 if (!stealth_mode) {
                     night_mode = !night_mode;
@@ -11966,7 +12011,7 @@ void loop() {
         last_user_input_ms = millis();
         if (ambient_mode) {
             ambient_mode = false;
-            M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+            M5Cardputer.Display.setBrightness(effective_brightness());
             // Wake the I2S peripheral from idle so the next tone() call
             // (often a UI click or alarm chime) doesn't hit a DMA assertion.
             M5Cardputer.Speaker.stop();
