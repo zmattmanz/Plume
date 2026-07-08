@@ -10387,7 +10387,11 @@ void setup() {
     // surge onto a charging cell and risk a boot-time brownout.
     boot_animate(62 + random(0, 3), "queuing Bluetooth");
     ble_event_queue = xQueueCreate(BLE_POOL_SIZE, sizeof(uint8_t));
-    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 2752, NULL, 1, &BLEWorkerHandle, 1);
+    // Stack must cover the matched-device path: scoring + BLE-pcap build +
+    // log_detection() (dataMutex, CSV formatting, and SD/FatFS writes, which
+    // alone can burn 1-2KB). 2752 overflowed there — only a *matched* device
+    // dives this deep, which is why unmatched feed traffic never crashed.
+    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 6144, NULL, 1, &BLEWorkerHandle, 1);
     boot_animate(68, "starting Bluetooth");
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
