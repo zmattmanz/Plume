@@ -2337,8 +2337,8 @@ static BleEventData ble_pool[BLE_POOL_SIZE];
 // to ble_worker_task on Core 1 after the pool slot's in_use flag is set.
 static volatile uint32_t ble_pool_write = 0;
 
-class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
-    void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
+class AdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
+    void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
         if (!scanner_ready) return;
         // Claim a pool slot. If the slot is still being processed by the
         // worker task, drop this advertisement — better than heap-allocating.
@@ -2367,7 +2367,7 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
         // sscanf round-trip on every advertisement (50–200/sec under
         // typical urban traffic — the steady alloc churn was the most
         // consistent heap-fragmentation source in the code).
-        const uint8_t* native = addr.getNative();
+        const uint8_t* native = addr.getVal();
         for (int i = 0; i < 6; i++) ev->mac[i] = native[5 - i];
         ev->addr_type = addr.getType();
 
@@ -2414,7 +2414,7 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     }
 };
 
-// Single shared instance — passed to setAdvertisedDeviceCallbacks at boot
+// Single shared instance — passed to setScanCallbacks at boot
 // and on every periodic NimBLE restart. Avoids the slow heap leak that
 // `new AdvertisedDeviceCallbacks()` produced every restart cycle.
 static AdvertisedDeviceCallbacks ble_cb_singleton;
@@ -2430,10 +2430,10 @@ static void export_restore_promiscuous() {
 
     // Reinitialize NimBLE while WiFi is off (maximum heap available)
     NimBLEDevice::init("");
-    NimBLEDevice::setPower(BLE_TX_POWER);
+    NimBLEDevice::setPowerLevel(BLE_TX_POWER);
     pBLEScan = NimBLEDevice::getScan();
     if (pBLEScan) {
-        pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
+        pBLEScan->setScanCallbacks(&ble_cb_singleton, false);
         pBLEScan->setActiveScan(false);
         apply_ble_scan_params();
         pBLEScan->setMaxResults(0);
@@ -4957,7 +4957,7 @@ void ScannerLoopTask(void* pvParameters) {
         if (pBLEScan && !scanning) {
             bool active = low_power_mode ? false : (ble_scan_cycle % 3 == 0);
             pBLEScan->setActiveScan(active);
-            pBLEScan->start(BLE_SCAN_DURATION, false);
+            pBLEScan->start(BLE_SCAN_DURATION * 1000, false);   // 2.x: duration in ms (was seconds)
             scan_start_ms = millis();
             ble_scan_cycle++;
         }
@@ -9899,14 +9899,14 @@ static void apply_ble_scan_params() {
     if (low_power_mode) {
         // 50% duty cycle: 125ms interval, 62.5ms window.
         // Flock devices advertise every 100-200ms — still caught reliably.
-        pBLEScan->setInterval(200);   // 200 × 0.625ms = 125ms
-        pBLEScan->setWindow(100);     // 100 × 0.625ms = 62.5ms
+        pBLEScan->setInterval(125);   // ms — NimBLE 2.x takes ms directly (was 0.625ms units)
+        pBLEScan->setWindow(63);      // ms (~62.5)
     } else {
         // Window MUST be < interval or coexistence can never schedule WiFi RX.
         // 60 ms listen per 100 ms = ~60% BLE duty, leaving ~40% for promiscuous.
         // Flock/Raven advertise often enough to still be caught within 1-2 intervals.
-        pBLEScan->setInterval(160);   // 160 × 0.625 ms = 100 ms
-        pBLEScan->setWindow(96);      // 96 × 0.625 ms  = 60 ms
+        pBLEScan->setInterval(100);   // ms — NimBLE 2.x takes ms directly (was 0.625ms units)
+        pBLEScan->setWindow(60);      // ms
     }
 }
 
@@ -10477,11 +10477,11 @@ void setup() {
     boot_animate(88, "starting sniffer");
 
     // NimBLE — complete before scanner screen appears
-    NimBLEDevice::init(""); NimBLEDevice::setMTU(23); NimBLEDevice::setPower(BLE_TX_POWER);
+    NimBLEDevice::init(""); NimBLEDevice::setMTU(23); NimBLEDevice::setPowerLevel(BLE_TX_POWER);
     Serial.printf("[BOOT] Free heap after NimBLE init: %u\n",
                   (unsigned)esp_get_free_heap_size());
     pBLEScan = NimBLEDevice::getScan();
-    pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
+    pBLEScan->setScanCallbacks(&ble_cb_singleton, false);
     pBLEScan->setActiveScan(false);
     apply_ble_scan_params();
     // Don't store results internally — every advertisement is already handled
@@ -11045,9 +11045,9 @@ static void service_ble_restart() {
         NimBLEDevice::deinit(true);
         delay(100);
         NimBLEDevice::init("");
-        NimBLEDevice::setPower(BLE_TX_POWER);
+        NimBLEDevice::setPowerLevel(BLE_TX_POWER);
         pBLEScan = NimBLEDevice::getScan();
-        pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
+        pBLEScan->setScanCallbacks(&ble_cb_singleton, false);
         pBLEScan->setActiveScan(false);
         apply_ble_scan_params();
         pBLEScan->setMaxResults(0);
