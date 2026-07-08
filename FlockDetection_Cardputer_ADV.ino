@@ -266,6 +266,15 @@ static bool low_power_mode = false;
 static bool turbo_mode_active = false;
 static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
 
+// Effective backlight target. The Cardputer ADV has no software-controllable
+// charger (M5Unified maps it to pmic_adc — setChargeCurrent() is a no-op), so
+// the only way to stay charge-positive on USB is to cut load. The backlight is
+// the single largest continuous draw, so low-power mode forces it down to the
+// dim ambient level. stealth (5) is handled separately and is dimmer still.
+static inline uint8_t effective_brightness() {
+    return low_power_mode ? AMBIENT_BRIGHTNESS : BRIGHTNESS_LEVELS[brightness_level];
+}
+
 // RGB LED state — color cycles with C key, on/off with L when locator idle
 static uint8_t led_r = 77, led_g = 219, led_b = 194;  // default teal (matches HEADER_COLOR)
 static bool    led_breathing_on = true;
@@ -1401,7 +1410,7 @@ void LedTask(void* pv) {
             led_detect_active = false;
             bool export_on = (export_mode_active || export_connecting);
             bool show_led = !stealth_mode && !night_mode &&
-                            (export_on || (led_breathing_on && brightness_level >= 2));
+                            (export_on || (led_breathing_on && brightness_level >= 2 && !low_power_mode));
             if (show_led) {
                 float breath = anim_pulse(export_on ? UI_PULSE_MEDIUM : UI_PULSE_BREATHE);
                 float dim    = export_on ? (0.30f + breath * 0.55f) : (0.15f + breath * 0.35f);
@@ -2328,8 +2337,8 @@ static BleEventData ble_pool[BLE_POOL_SIZE];
 // to ble_worker_task on Core 1 after the pool slot's in_use flag is set.
 static volatile uint32_t ble_pool_write = 0;
 
-class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
-    void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
+class AdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
+    void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
         if (!scanner_ready) return;
         // Claim a pool slot. If the slot is still being processed by the
         // worker task, drop this advertisement — better than heap-allocating.
@@ -2358,7 +2367,7 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
         // sscanf round-trip on every advertisement (50–200/sec under
         // typical urban traffic — the steady alloc churn was the most
         // consistent heap-fragmentation source in the code).
-        const uint8_t* native = addr.getNative();
+        const uint8_t* native = addr.getVal();
         for (int i = 0; i < 6; i++) ev->mac[i] = native[5 - i];
         ev->addr_type = addr.getType();
 
@@ -2405,7 +2414,7 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     }
 };
 
-// Single shared instance — passed to setAdvertisedDeviceCallbacks at boot
+// Single shared instance — passed to setScanCallbacks at boot
 // and on every periodic NimBLE restart. Avoids the slow heap leak that
 // `new AdvertisedDeviceCallbacks()` produced every restart cycle.
 static AdvertisedDeviceCallbacks ble_cb_singleton;
@@ -2421,10 +2430,10 @@ static void export_restore_promiscuous() {
 
     // Reinitialize NimBLE while WiFi is off (maximum heap available)
     NimBLEDevice::init("");
-    NimBLEDevice::setPower(BLE_TX_POWER);
+    NimBLEDevice::setPowerLevel(BLE_TX_POWER);
     pBLEScan = NimBLEDevice::getScan();
     if (pBLEScan) {
-        pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
+        pBLEScan->setScanCallbacks(&ble_cb_singleton, false);
         pBLEScan->setActiveScan(false);
         apply_ble_scan_params();
         pBLEScan->setMaxResults(0);
@@ -4948,7 +4957,7 @@ void ScannerLoopTask(void* pvParameters) {
         if (pBLEScan && !scanning) {
             bool active = low_power_mode ? false : (ble_scan_cycle % 3 == 0);
             pBLEScan->setActiveScan(active);
-            pBLEScan->start(BLE_SCAN_DURATION, false);
+            pBLEScan->start(BLE_SCAN_DURATION * 1000, false);   // 2.x: duration in ms (was seconds)
             scan_start_ms = millis();
             ble_scan_cycle++;
         }
@@ -6237,6 +6246,10 @@ static void set_turbo_mode(bool on) {
         if (low_power_mode) {
             low_power_mode = false;
             apply_ble_scan_params();
+            // Low-power dimmed the backlight; turbo means full performance, so
+            // bring it back up (unless stealth/ambient own it).
+            if (!stealth_mode && !ambient_mode)
+                M5Cardputer.Display.setBrightness(effective_brightness());
         }
         setCpuFrequencyMhz(240);
         set_toast_direct("TURBO ON", TOAST_SUCCESS);
@@ -6272,6 +6285,10 @@ void handle_menu_select() {
                 setCpuFrequencyMhz(160);
                 set_toast_direct("LOW POWER OFF", TOAST_NEUTRAL);
             }
+            // Apply the backlight change now (dim on, restore on off). Skip when
+            // stealth/ambient own the backlight so we don't fight them.
+            if (!stealth_mode && !ambient_mode)
+                M5Cardputer.Display.setBrightness(effective_brightness());
             apply_ble_scan_params();
             schedule_persist();
             screen_dirty = true;
@@ -9882,14 +9899,14 @@ static void apply_ble_scan_params() {
     if (low_power_mode) {
         // 50% duty cycle: 125ms interval, 62.5ms window.
         // Flock devices advertise every 100-200ms — still caught reliably.
-        pBLEScan->setInterval(200);   // 200 × 0.625ms = 125ms
-        pBLEScan->setWindow(100);     // 100 × 0.625ms = 62.5ms
+        pBLEScan->setInterval(125);   // ms — NimBLE 2.x takes ms directly (was 0.625ms units)
+        pBLEScan->setWindow(63);      // ms (~62.5)
     } else {
         // Window MUST be < interval or coexistence can never schedule WiFi RX.
         // 60 ms listen per 100 ms = ~60% BLE duty, leaving ~40% for promiscuous.
         // Flock/Raven advertise often enough to still be caught within 1-2 intervals.
-        pBLEScan->setInterval(160);   // 160 × 0.625 ms = 100 ms
-        pBLEScan->setWindow(96);      // 96 × 0.625 ms  = 60 ms
+        pBLEScan->setInterval(100);   // ms — NimBLE 2.x takes ms directly (was 0.625ms units)
+        pBLEScan->setWindow(60);      // ms
     }
 }
 
@@ -10113,6 +10130,14 @@ void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
 
+    // Drop to the lowest clock for the brown-out-prone early boot. The ESP32-S3
+    // powers on at the board's full configured clock (typ. 240 MHz), so without
+    // this the CPU draws peak current through the whole pre-radio window (sprite,
+    // SD, GPS, LittleFS) — exactly where a depleted cell collapses (reset_reason
+    // 9 / BROWNOUT). 80 MHz is plenty for display+SD+GPS; the steady-state clock
+    // is set later, right before radio init.
+    setCpuFrequencyMhz(80);
+
     // PSRAM availability + heap snapshot. Total PSRAM = 0 means PSRAM
     // isn't enabled in the board config; setPsram(true) will silently fall
     // through to internal RAM and the sprite-fallback path will kick in.
@@ -10152,10 +10177,13 @@ void setup() {
     dataMutex = xSemaphoreCreateRecursiveMutex();
     sdMutex   = xSemaphoreCreateMutex();
 
-    // Create the draw sprite FIRST, before WiFi / BLE / LittleFS eat internal
-    // heap. Try PSRAM first (frees ~64KB of internal SRAM for the WiFi/BLE
-    // radio stacks); fall back to internal SRAM on boards without PSRAM
-    // configured. Hard-fail on total allocation failure.
+    // Create the 54KB draw sprite FIRST, on the clean heap. It is a single
+    // contiguous block — the hardest allocation to satisfy on this no-PSRAM
+    // ESP32-S3FN8 (Total PSRAM: 0) — so it must go before WiFi/BLE/LittleFS
+    // fragment internal RAM. (The BLE controller, by contrast, allocates in
+    // smaller pieces and fits fine in the fragmented remainder — verified: it
+    // inits at ~91KB free.) createSprite tries PSRAM first (a no-op here), then
+    // internal. Hard-fail visibly if even this can't fit.
     spr.setColorDepth(16);
     spr.setPsram(true);
     void* sprite_buf = spr.createSprite(DISP_W, SPR_H);
@@ -10190,7 +10218,11 @@ void setup() {
     {
         const int FADE_STEPS   = 16;
         const int FADE_STEP_MS = (int)UI_ANIM_NORMAL / FADE_STEPS;
-        const int target_b     = BRIGHTNESS_LEVELS[brightness_level];
+        // Keep the backlight dim through the whole risky boot phase (SD, GPS,
+        // LittleFS, radio init) — the backlight is the largest early load and
+        // this is where a depleted cell browns out. The title-card reveal at
+        // the end of setup() ramps to full brightness, after the surge is over.
+        const int target_b     = AMBIENT_BRIGHTNESS;
         for (int i = 0; i <= FADE_STEPS; i++) {
             int b = (target_b * i) / FADE_STEPS;
             M5Cardputer.Display.setBrightness(b);
@@ -10350,10 +10382,16 @@ void setup() {
     }
     boot_animate(58 + random(0, 3), "calibrating battery");
 
-    setCpuFrequencyMhz(240);
-    boot_animate(62 + random(0, 3), "boosting CPU");
+    // Stay at the low boot clock — the BLE worker only blocks on a queue until
+    // the radio is brought up later, so 240 MHz here would just stack a CPU
+    // surge onto a charging cell and risk a boot-time brownout.
+    boot_animate(62 + random(0, 3), "queuing Bluetooth");
     ble_event_queue = xQueueCreate(BLE_POOL_SIZE, sizeof(uint8_t));
-    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 2752, NULL, 1, &BLEWorkerHandle, 1);
+    // Stack must cover the matched-device path: scoring + BLE-pcap build +
+    // log_detection() (dataMutex, CSV formatting, and SD/FatFS writes, which
+    // alone can burn 1-2KB). 2752 overflowed there — only a *matched* device
+    // dives this deep, which is why unmatched feed traffic never crashed.
+    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 6144, NULL, 1, &BLEWorkerHandle, 1);
     boot_animate(68, "starting Bluetooth");
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
@@ -10459,11 +10497,11 @@ void setup() {
     boot_animate(88, "starting sniffer");
 
     // NimBLE — complete before scanner screen appears
-    NimBLEDevice::init(""); NimBLEDevice::setMTU(23); NimBLEDevice::setPower(BLE_TX_POWER);
+    NimBLEDevice::init(""); NimBLEDevice::setMTU(23); NimBLEDevice::setPowerLevel(BLE_TX_POWER);
     Serial.printf("[BOOT] Free heap after NimBLE init: %u\n",
                   (unsigned)esp_get_free_heap_size());
     pBLEScan = NimBLEDevice::getScan();
-    pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
+    pBLEScan->setScanCallbacks(&ble_cb_singleton, false);
     pBLEScan->setActiveScan(false);
     apply_ble_scan_params();
     // Don't store results internally — every advertisement is already handled
@@ -10534,7 +10572,7 @@ void setup() {
 
     // ── Title card boot sequence ──
     {
-        int start_brightness = BRIGHTNESS_LEVELS[brightness_level];
+        int start_brightness = effective_brightness();
 
         // Phase 1: Fade out boot screen
         {
@@ -10655,6 +10693,8 @@ static void service_battery_warnings(int32_t loop_mv) {
             turbo_mode_active = false;
             low_power_mode = true;
             setCpuFrequencyMhz(80);
+            if (!stealth_mode && !ambient_mode)
+                M5Cardputer.Display.setBrightness(effective_brightness());
             apply_ble_scan_params();      // applies 50%-duty BLE params
             schedule_persist();           // flush state now in case of imminent cutoff
             set_toast_direct("LOW BATT - CONSERVING", TOAST_WARNING, false);
@@ -10868,7 +10908,7 @@ static void service_ambient_mode() {
     // Exit ambient if conditions change from non-input sources
     if (ambient_mode && (signal_active || export_mode_active || toast_active)) {
         ambient_mode = false;
-        M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+        M5Cardputer.Display.setBrightness(effective_brightness());
     }
 }
 
@@ -11000,9 +11040,9 @@ static void service_ble_restart() {
         NimBLEDevice::deinit(true);
         delay(100);
         NimBLEDevice::init("");
-        NimBLEDevice::setPower(BLE_TX_POWER);
+        NimBLEDevice::setPowerLevel(BLE_TX_POWER);
         pBLEScan = NimBLEDevice::getScan();
-        pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
+        pBLEScan->setScanCallbacks(&ble_cb_singleton, false);
         pBLEScan->setActiveScan(false);
         apply_ble_scan_params();
         pBLEScan->setMaxResults(0);
@@ -11136,7 +11176,7 @@ static void handle_keyboard_input() {
         screen_dirty = true;
         if (ambient_mode) {
             ambient_mode = false;
-            M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+            M5Cardputer.Display.setBrightness(effective_brightness());
             // Same I2S wake as the BtnA path.
             M5Cardputer.Speaker.stop();
         }
@@ -11593,7 +11633,7 @@ static void handle_keyboard_input() {
             else if (c == 'b') {
                 if (!stealth_mode) {
                     brightness_level = (brightness_level + 1) % 3;
-                    M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+                    M5Cardputer.Display.setBrightness(effective_brightness());
                     // Disable LED at dim levels, re-enable at full brightness
                     if (brightness_level < 2) {
                         led_breathing_on = false;
@@ -11603,7 +11643,7 @@ static void handle_keyboard_input() {
                     schedule_persist();
                 }
             }
-            else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(5); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); render_frame(); } schedule_persist(); }
+            else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(5); } else { M5Cardputer.Display.setBrightness(effective_brightness()); draw_current_screen(); render_frame(); } schedule_persist(); }
             else if (c == 'n') {
                 if (!stealth_mode) {
                     night_mode = !night_mode;
@@ -11966,7 +12006,7 @@ void loop() {
         last_user_input_ms = millis();
         if (ambient_mode) {
             ambient_mode = false;
-            M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+            M5Cardputer.Display.setBrightness(effective_brightness());
             // Wake the I2S peripheral from idle so the next tone() call
             // (often a UI click or alarm chime) doesn't hit a DMA assertion.
             M5Cardputer.Speaker.stop();
