@@ -138,6 +138,22 @@ static unsigned long last_user_input_ms = 0;
 // short enough that pocket-sitting doesn't burn unnecessary battery.
 static const unsigned long AMBIENT_TIMEOUT_MS = 2UL * 60UL * 1000UL;
 static const uint8_t AMBIENT_BRIGHTNESS = 40;
+
+// ── Charge Mode ─────────────────────────────────────────────────────────────
+// A minimal, radios-off holding state that (a) prevents the brown-out boot loop
+// when the cell is too low to survive radio init, and (b) charges as fast as
+// this fixed-charge-current hardware allows by cutting every avoidable load.
+// Entered automatically at boot below CHARGE_MODE_ENTER_MV, or on demand via
+// the 'c' key (which sets charge_mode_request in RTC RAM and reboots into it).
+// Exits — resuming the normal app — once the cell HOLDS above CHARGE_MODE_EXIT_MV
+// for a sustained window, or on any keypress. Thresholds are millivolts measured
+// under charge-mode's own near-zero load; EXIT sits well above ENTER so the
+// radios' load sag on resume can't immediately drop back under the brown-out
+// floor and re-trigger the loop.
+#define CHARGE_MODE_ENTER_MV  3400          // boot below this -> charge mode (anti-bootloop)
+#define CHARGE_MODE_EXIT_MV   3650          // hold above this -> resume the app
+#define CHARGE_MODE_MAGIC     0x50C0FFEEUL  // "enter charge mode on next boot" sentinel
+RTC_DATA_ATTR uint32_t charge_mode_request = 0;  // survives ESP.restart(), cleared on power loss
 static bool ambient_mode = false;
 
 unsigned long vol_overlay_start = 0;
@@ -1527,6 +1543,92 @@ static int voltage_to_percent(int32_t mv) {
         }
     }
     return 0;
+}
+
+// Averaged raw battery read for Charge Mode. No sag model / EMA: the radios are
+// off so the cell is barely loaded and the ADC reading already sits near
+// open-circuit; a simple mean just denoises it.
+static int32_t charge_mode_read_mv() {
+    int32_t sum = 0;
+    const int N = 16;
+    for (int i = 0; i < N; i++) { sum += M5Cardputer.Power.getBatteryVoltage(); delay(2); }
+    return sum / N;
+}
+
+// Minimal charging screen + hold loop. Self-contained (hardcoded colors, direct
+// LCD) because it runs during early boot before the runtime palette and the
+// draw sprite exist. Returns when the user presses a key ("start now") or the
+// cell holds above CHARGE_MODE_EXIT_MV long enough to safely bring the radios
+// up; the caller then continues the normal boot.
+void run_charge_mode() {
+    charge_mode_request = 0;                 // consume the request (auto-re-entry is voltage-driven)
+    setCpuFrequencyMhz(80);                  // lowest clock = least load
+    auto& lcd = M5Cardputer.Display;
+    lcd.setRotation(1);
+    lcd.setBrightness(AMBIENT_BRIGHTNESS);   // dim but legible
+    M5Cardputer.Speaker.setVolume(0);        // stay silent
+
+    const uint16_t COL_BG   = lgfx::color565(0, 0, 0);
+    const uint16_t COL_TEXT = lgfx::color565(230, 230, 230);
+    const uint16_t COL_DIM  = lgfx::color565(120, 120, 120);
+    const uint16_t COL_GOOD = lgfx::color565(60, 210, 120);   // green: safe to resume
+    const uint16_t COL_LOW  = lgfx::color565(230, 170, 40);   // amber: still charging
+
+    lcd.fillScreen(COL_BG);
+
+    uint32_t exit_stable_since = 0;   // 0 = not currently above EXIT threshold
+    int32_t  last_mv  = -1;
+    int      last_pct = -1;
+
+    for (;;) {
+        M5Cardputer.update();
+
+        // Any keypress = user override, "start the app now".
+        if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) return;
+
+        int32_t mv  = charge_mode_read_mv();
+        int     pct = voltage_to_percent(mv);
+
+        // Auto-resume once the cell HOLDS above EXIT for a sustained window, so a
+        // momentary spike doesn't bounce us into a brown-out the instant radios load it.
+        if (mv >= CHARGE_MODE_EXIT_MV) {
+            if (exit_stable_since == 0)                         exit_stable_since = millis();
+            else if (millis() - exit_stable_since >= 4000)      return;
+        } else {
+            exit_stable_since = 0;
+        }
+
+        if (mv != last_mv || pct != last_pct) {   // redraw only on change (no flicker)
+            last_mv = mv; last_pct = pct;
+            uint16_t accent = (mv >= CHARGE_MODE_EXIT_MV) ? COL_GOOD : COL_LOW;
+            lcd.fillScreen(COL_BG);
+
+            lcd.setTextDatum(TC_DATUM);
+            lcd.setTextColor(accent, COL_BG);
+            lcd.setTextSize(2);                    // literal sizes OK here (boot-screen context)
+            lcd.drawString("CHARGING", DISP_W / 2, 14);
+
+            char vbuf[16];
+            snprintf(vbuf, sizeof(vbuf), "%d.%02d V", (int)(mv / 1000), (int)((mv % 1000) / 10));
+            lcd.setTextDatum(MC_DATUM);
+            lcd.setTextColor(COL_TEXT, COL_BG);
+            lcd.setTextSize(4);
+            lcd.drawString(vbuf, DISP_W / 2, DISP_H / 2);
+
+            char pbuf[8];
+            snprintf(pbuf, sizeof(pbuf), "%d%%", pct);
+            lcd.setTextDatum(BC_DATUM);
+            lcd.setTextColor(accent, COL_BG);
+            lcd.setTextSize(2);
+            lcd.drawString(pbuf, DISP_W / 2, DISP_H - 26);
+
+            lcd.setTextColor(COL_DIM, COL_BG);
+            lcd.setTextSize(1);
+            lcd.drawString("radios off  -  any key to start", DISP_W / 2, DISP_H - 8);
+        }
+
+        delay(500);
+    }
 }
 
 // ============================================================================
@@ -10165,6 +10267,26 @@ void setup() {
         Serial.printf("[BOOT] reset_reason=%d (%s)\n", (int)rr, rs);
     }
 
+    // ── Charge Mode gate ────────────────────────────────────────────────────
+    // Before touching the sprite or radios (the brown-out-prone loads), decide
+    // whether the cell can survive a normal boot. If it's below the entry floor,
+    // or the user requested charge mode via 'c' (which reboots with this flag),
+    // hold in the radios-off charging screen until it recovers or a key is
+    // pressed. This is what breaks the low-battery boot loop: we never reach
+    // radio init on a cell that can't power it.
+    {
+        int32_t boot_mv = charge_mode_read_mv();
+        bool requested  = (charge_mode_request == CHARGE_MODE_MAGIC);
+        Serial.printf("[BOOT] battery=%dmV, charge_mode_request=%s\n",
+                      (int)boot_mv, requested ? "yes" : "no");
+        if (requested || boot_mv < CHARGE_MODE_ENTER_MV) {
+            Serial.printf("[BOOT] entering Charge Mode (%s)\n",
+                          requested ? "user request" : "battery below entry floor");
+            run_charge_mode();
+            Serial.println("[BOOT] leaving Charge Mode -> normal boot");
+        }
+    }
+
     // Shrink speaker DMA buffers so I2S allocation doesn't eat the DMA pool.
     {
         auto spk_cfg = M5Cardputer.Speaker.config();
@@ -11655,6 +11777,17 @@ static void handle_keyboard_input() {
                     } else {
                         set_toast_direct("DAY MODE", TOAST_NEUTRAL);
                     }
+                }
+            }
+            else if (c == 'c') {
+                // Charge Mode: reboot into the radios-off charging screen. A
+                // reboot is required to actually shed the WiFi/BLE load — the
+                // RTC flag survives ESP.restart() and is caught by the boot gate.
+                if (!stealth_mode) {
+                    charge_mode_request = CHARGE_MODE_MAGIC;
+                    set_toast_direct("CHARGE MODE", TOAST_SUCCESS);
+                    delay(600);          // let the toast render before we reset
+                    ESP.restart();
                 }
             }
             else if (c == 'l') {
