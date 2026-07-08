@@ -10177,14 +10177,30 @@ void setup() {
     dataMutex = xSemaphoreCreateRecursiveMutex();
     sdMutex   = xSemaphoreCreateMutex();
 
-    // NOTE: the 54KB draw sprite is created LATER, after WiFi + BLE controller
-    // init (see the "arming scanner" stage below). This board is a no-PSRAM
-    // ESP32-S3FN8 (Total PSRAM: 0), so allocating the sprite first fragments
-    // internal RAM and starves the BLE controller of the contiguous DMA block
-    // it needs at init — the exact failure that crashed here with
-    // `assert failed: block_locate_free ... tlsf`. Radios claim their memory
-    // first from a clean heap; the sprite takes what remains. The boot
-    // animation draws straight to the LCD, so it needs no sprite yet.
+    // Create the 54KB draw sprite FIRST, on the clean heap. It is a single
+    // contiguous block — the hardest allocation to satisfy on this no-PSRAM
+    // ESP32-S3FN8 (Total PSRAM: 0) — so it must go before WiFi/BLE/LittleFS
+    // fragment internal RAM. (The BLE controller, by contrast, allocates in
+    // smaller pieces and fits fine in the fragmented remainder — verified: it
+    // inits at ~91KB free.) createSprite tries PSRAM first (a no-op here), then
+    // internal. Hard-fail visibly if even this can't fit.
+    spr.setColorDepth(16);
+    spr.setPsram(true);
+    void* sprite_buf = spr.createSprite(DISP_W, SPR_H);
+    if (!sprite_buf) {
+        Serial.println("[GFX] PSRAM sprite failed, falling back to internal");
+        spr.setPsram(false);
+        sprite_buf = spr.createSprite(DISP_W, SPR_H);
+    }
+    if (!sprite_buf) {
+        M5Cardputer.Display.fillScreen(lgfx::color565(255, 0, 0));
+        M5Cardputer.Display.setCursor(10, 10);
+        M5Cardputer.Display.print("SPRITE ALLOC FAIL");
+        while (1) delay(1000);
+    }
+    Serial.printf("[GFX] Sprite allocated in %s, free heap: %u\n",
+                  (ESP.getPsramSize() > 0 && (uint32_t)sprite_buf >= 0x3C000000) ? "PSRAM" : "internal",
+                  (unsigned)esp_get_free_heap_size());
 
     // LED: start dark. The breathing task is spawned at the very end of setup()
     // to avoid RMT/radio contention during WiFi + BLE init on core 0.
@@ -10489,31 +10505,6 @@ void setup() {
     // default cache can hit 10–20 KB in a busy RF environment for no benefit.
     pBLEScan->setMaxResults(0);
     last_ble_restart_ms = millis();
-
-    // ── Draw sprite allocated HERE, now that WiFi + BLE controllers already
-    // hold their contiguous internal RAM. On this no-PSRAM board the sprite
-    // takes whatever internal heap remains; the earlier ordering (sprite first)
-    // starved the BLE controller and crashed at init. createSprite still tries
-    // PSRAM first (a no-op with none present), then internal. First real sprite
-    // use is the title-card dissolve after setup(), so this is early enough.
-    spr.setColorDepth(16);
-    spr.setPsram(true);
-    void* sprite_buf = spr.createSprite(DISP_W, SPR_H);
-    if (!sprite_buf) {
-        Serial.println("[GFX] PSRAM sprite failed, falling back to internal");
-        spr.setPsram(false);
-        sprite_buf = spr.createSprite(DISP_W, SPR_H);
-    }
-    if (!sprite_buf) {
-        M5Cardputer.Display.fillScreen(lgfx::color565(255, 0, 0));
-        M5Cardputer.Display.setCursor(10, 10);
-        M5Cardputer.Display.print("SPRITE ALLOC FAIL");
-        while (1) delay(1000);
-    }
-    Serial.printf("[GFX] Sprite allocated in %s, free heap: %u\n",
-                  (ESP.getPsramSize() > 0 && (uint32_t)sprite_buf >= 0x3C000000) ? "PSRAM" : "internal",
-                  (unsigned)esp_get_free_heap_size());
-
     boot_animate(96, "arming scanner");
 
     // Tasks
