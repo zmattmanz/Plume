@@ -158,7 +158,12 @@ static const uint8_t AMBIENT_BRIGHTNESS = 40;
 #define CHARGE_MODE_ENTER_MV  3550          // boot below this -> charge mode (anti-bootloop)
 #define CHARGE_MODE_EXIT_MV   3750          // hold above this -> resume the app
 #define CHARGE_MODE_MAGIC     0x50C0FFEEUL  // "enter charge mode on next boot" sentinel
-RTC_DATA_ATTR uint32_t charge_mode_request = 0;  // survives ESP.restart(), cleared on power loss
+// RTC_NOINIT, not RTC_DATA: an initialized RTC_DATA var gets reloaded from the
+// app image on a normal reboot, so the request was being wiped by the very
+// restart meant to carry it (charge mode came up only intermittently). NOINIT
+// retains its value across esp_restart(); the boot gate additionally requires
+// an ESP_RST_SW reset before honoring it, so power-on garbage can't false-fire.
+RTC_NOINIT_ATTR uint32_t charge_mode_request;
 static bool ambient_mode = false;
 
 unsigned long vol_overlay_start = 0;
@@ -1567,11 +1572,17 @@ static int32_t charge_mode_read_mv() {
 // up; the caller then continues the normal boot.
 void run_charge_mode() {
     charge_mode_request = 0;                 // consume the request (auto-re-entry is voltage-driven)
-    setCpuFrequencyMhz(80);                  // lowest clock = least load
+    setCpuFrequencyMhz(40);                  // lowest clock = least load
     auto& lcd = M5Cardputer.Display;
     lcd.setRotation(1);
-    lcd.setBrightness(AMBIENT_BRIGHTNESS);   // dim but legible
-    M5Cardputer.Speaker.setVolume(0);        // stay silent
+    lcd.setBrightness(AMBIENT_BRIGHTNESS);   // dim but legible (lit briefly, then cut — see loop)
+
+    // Cut the remaining begin()-powered loads that aren't needed to charge.
+    // The WS2812 holds its last latched colour across the reboot that enters
+    // charge mode (VDD stays up; only the RMT driver resets), so it can glow for
+    // the whole session unless we blank it — the LED task that would isn't up yet.
+    set_cardputer_led(0, 0, 0);              // blank the RGB LED
+    M5Cardputer.Speaker.end();               // power down the I2S amp (setVolume(0) only mutes)
 
     const uint16_t COL_BG   = lgfx::color565(0, 0, 0);
     const uint16_t COL_TEXT = lgfx::color565(230, 230, 230);
@@ -1590,12 +1601,25 @@ void run_charge_mode() {
     uint32_t exit_stable_since = 0;   // 0 = not currently above EXIT threshold
     int32_t  last_shown_mv    = -1;
     int      last_pct         = -1;
+    bool     key_armed        = false;  // require one release before a press exits,
+                                        // so the 'c' that launched us (or any held
+                                        // key) can't fire an instant exit on entry.
 
+    // The screen stays lit (dimly) the whole time so the voltage is always
+    // readable. The backlight is the largest remaining load, so it runs at the
+    // dim ambient level with the CPU held at 40 MHz; every other begin()-powered
+    // load (RGB LED, speaker amp, IMU, radios) is cut. We deliberately do NOT
+    // light-sleep the core between samples: the backlight PWM's clock gets gated
+    // in light sleep, so the brightness wouldn't hold steady — and a stable,
+    // readable screen is the whole point of keeping it on. A plain delay paces
+    // the loop instead.
     for (;;) {
         M5Cardputer.update();
 
-        // Any keypress = user override, "start the app now".
-        if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) return;
+        bool pressed = M5Cardputer.Keyboard.isPressed();
+        if (!pressed) key_armed = true;
+        // Once armed, any fresh keypress = user override, "start the app now".
+        if (key_armed && M5Cardputer.Keyboard.isChange() && pressed) return;
 
         int32_t raw = charge_mode_read_mv();
         ema_mv = (ema_mv == 0.0f) ? (float)raw : (0.2f * (float)raw + 0.8f * ema_mv);
@@ -10245,6 +10269,7 @@ void setup() {
     delay(500);
 
     auto cfg = M5.config();
+    cfg.internal_imu = false;   // IMU is unused app-wide; don't power or poll it
     M5Cardputer.begin(cfg);
 
     // Drop to the lowest clock for the brown-out-prone early boot. The ESP32-S3
@@ -10291,7 +10316,12 @@ void setup() {
     // radio init on a cell that can't power it.
     {
         int32_t boot_mv   = charge_mode_read_mv();
-        bool    requested = (charge_mode_request == CHARGE_MODE_MAGIC);
+        // Honor the 'c'-key request only after a software restart (esp_restart);
+        // on power-on the NOINIT value is indeterminate. Consume it immediately
+        // so a stale value can't re-trigger on a later boot.
+        bool    requested = (esp_reset_reason() == ESP_RST_SW)
+                            && (charge_mode_request == CHARGE_MODE_MAGIC);
+        charge_mode_request = 0;
         // A brownout reset means the last boot's radio-init surge collapsed the
         // rail. The resting reading here reads deceptively high (no load yet), so
         // it alone won't stop the loop — but the reset reason will. Hold and
@@ -10310,11 +10340,16 @@ void setup() {
     }
 
     // Shrink speaker DMA buffers so I2S allocation doesn't eat the DMA pool.
+    // The end()+begin() also restarts the amp if Charge Mode powered it down on
+    // the resume path (Speaker.end() there), and is what makes the shrunk config
+    // actually take effect — a live config change only applies on the next begin.
     {
         auto spk_cfg = M5Cardputer.Speaker.config();
         spk_cfg.dma_buf_count = 3;     // default 8
         spk_cfg.dma_buf_len   = 128;   // default 512; simple sine tones don't need more
         M5Cardputer.Speaker.config(spk_cfg);
+        M5Cardputer.Speaker.end();     // no-op if already stopped (e.g. by Charge Mode)
+        M5Cardputer.Speaker.begin();   // (re)start with the shrunk buffers
     }
 
     // dataMutex MUST be created before any task that uses it is spawned.
@@ -11803,12 +11838,19 @@ static void handle_keyboard_input() {
             }
             else if (c == 'c') {
                 // Charge Mode: reboot into the radios-off charging screen. A
-                // reboot is required to actually shed the WiFi/BLE load — the
-                // RTC flag survives ESP.restart() and is caught by the boot gate.
+                // reboot is required to actually shed the WiFi/BLE load; the
+                // RTC_NOINIT flag carries the request across esp_restart() to the
+                // boot gate. Draw the confirmation directly (the render loop is
+                // about to stop, so a toast would never paint).
                 if (!stealth_mode) {
                     charge_mode_request = CHARGE_MODE_MAGIC;
-                    set_toast_direct("CHARGE MODE", TOAST_SUCCESS);
-                    delay(600);          // let the toast render before we reset
+                    auto& lcd = M5Cardputer.Display;
+                    lcd.fillScreen(lgfx::color565(0, 0, 0));
+                    lcd.setTextDatum(MC_DATUM);
+                    lcd.setTextColor(lgfx::color565(60, 210, 120), lgfx::color565(0, 0, 0));
+                    lcd.setTextSize(2);
+                    lcd.drawString("CHARGE MODE", DISP_W / 2, DISP_H / 2);
+                    delay(400);
                     ESP.restart();
                 }
             }
