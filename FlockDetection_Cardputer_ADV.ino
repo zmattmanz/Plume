@@ -156,7 +156,12 @@ static const uint8_t AMBIENT_BRIGHTNESS = 40;
 // 3.72V level the full app was observed to boot+run at, with margin so the
 // radios' load sag on resume can't drop straight back under the brownout floor.
 #define CHARGE_MODE_ENTER_MV  3550          // boot below this -> charge mode (anti-bootloop)
-#define CHARGE_MODE_EXIT_MV   3750          // hold above this -> resume the app
+#define CHARGE_MODE_EXIT_MV   3750          // AUTO-entered: hold above this -> resume the app
+// USER-requested charge (the 'c' key) isn't about brown-out safety — the user
+// wants to top the cell up — so it must NOT resume at the 3.75V safe floor.
+// It holds until the cell is essentially full or the user presses a key. On this
+// trickle charger it may never reach full, which is fine: a keypress always exits.
+#define CHARGE_MODE_FULL_MV   4150          // USER-requested: hold above this -> resume the app
 #define CHARGE_MODE_MAGIC     0x50C0FFEEUL  // "enter charge mode on next boot" sentinel
 // RTC_NOINIT, not RTC_DATA: an initialized RTC_DATA var gets reloaded from the
 // app image on a normal reboot, so the request was being wiped by the very
@@ -1568,105 +1573,214 @@ static int32_t charge_mode_read_mv() {
 // Minimal charging screen + hold loop. Self-contained (hardcoded colors, direct
 // LCD) because it runs during early boot before the runtime palette and the
 // draw sprite exist. Returns when the user presses a key ("start now") or the
-// cell holds above CHARGE_MODE_EXIT_MV long enough to safely bring the radios
-// up; the caller then continues the normal boot.
-void run_charge_mode() {
+// cell holds above the resume threshold long enough. That threshold depends on
+// WHY we're here: an auto entry (low battery / brownout) resumes at the
+// safe-to-run floor CHARGE_MODE_EXIT_MV, while a user 'c'-request is a deliberate
+// top-up and holds until CHARGE_MODE_FULL_MV. A brownout entry additionally
+// ratchets the threshold above the current resting voltage (see below) so a
+// boot that browns out ABOVE the floor can't retry-loop at a level that already
+// failed. The caller then continues normal boot.
+void run_charge_mode(bool user_requested, bool after_brownout) {
+    int32_t resume_mv = user_requested ? CHARGE_MODE_FULL_MV : CHARGE_MODE_EXIT_MV;
     charge_mode_request = 0;                 // consume the request (auto-re-entry is voltage-driven)
-    setCpuFrequencyMhz(40);                  // lowest clock = least load
+    setCpuFrequencyMhz(40);                  // lowest safe clock = least load
     auto& lcd = M5Cardputer.Display;
     lcd.setRotation(1);
-    lcd.setBrightness(AMBIENT_BRIGHTNESS);   // dim but legible (lit briefly, then cut — see loop)
 
-    // Cut the remaining begin()-powered loads that aren't needed to charge.
-    // The WS2812 holds its last latched colour across the reboot that enters
-    // charge mode (VDD stays up; only the RMT driver resets), so it can glow for
-    // the whole session unless we blank it — the LED task that would isn't up yet.
-    set_cardputer_led(0, 0, 0);              // blank the RGB LED
+    // Kill the screen for the fastest charge. setBrightness(0) drops the backlight
+    // (by far the largest load) and sleep() puts the ST7789 controller to ~uA.
+    // There is deliberately NO LED indicator here: the WS2812 is powered off the
+    // backlight boost rail (GPIO 38 PWM) and only lights at full brightness, which
+    // would make it the single biggest load — useless for charging. So the panel
+    // stays dead-dark until the user asks to peek. Every exit path restores the
+    // panel (wakeup + brightness) so normal boot inherits a live display.
+    lcd.setBrightness(0);
+    lcd.sleep();
+
+    // Cut the other begin()-powered loads not needed to charge.
+    set_cardputer_led(0, 0, 0);              // LED off (its rail is down with the screen anyway)
     M5Cardputer.Speaker.end();               // power down the I2S amp (setVolume(0) only mutes)
 
-    const uint16_t COL_BG   = lgfx::color565(0, 0, 0);
-    const uint16_t COL_TEXT = lgfx::color565(230, 230, 230);
-    const uint16_t COL_DIM  = lgfx::color565(120, 120, 120);
-    const uint16_t COL_GOOD = lgfx::color565(60, 210, 120);   // green: safe to resume
-    const uint16_t COL_LOW  = lgfx::color565(230, 170, 40);   // amber: still charging
+    // ── Screen-off charging with on-demand peek ──────────────────────────────
+    // Passive draw is ~nil (backlight off, panel asleep) so the cell charges as
+    // fast as the hardware allows. Pressing any key wakes the screen for PEEK_MS
+    // to show voltage/%, then it sleeps again. A SECOND press while the readout is
+    // up is the "start the app now" override — so an accidental single tap only
+    // peeks and can't boot a depleted cell straight into the radios.
+    const uint32_t PEEK_MS   = 3000;
+    const uint32_t SAMPLE_MS = 1000;
 
-    lcd.fillScreen(COL_BG);
-
-    // The battery ADC on this board is noisy, and while charging on the shared
-    // rail the voltage genuinely ripples (charger behaviour + the 500ms redraw's
-    // own current pulse). Smooth it with an EMA (~2s time constant at a=0.2 /
-    // 500ms) so the number is stable and the resume decision can't be tripped by
-    // a single spike.
-    float    ema_mv           = 0.0f;
+    int32_t  mv               = charge_mode_read_mv();   // prime a valid reading
+    float    ema_mv           = (float)mv;
+    uint32_t last_sample_ms   = millis();
     uint32_t exit_stable_since = 0;   // 0 = not currently above EXIT threshold
-    int32_t  last_shown_mv    = -1;
-    int      last_pct         = -1;
-    bool     key_armed        = false;  // require one release before a press exits,
-                                        // so the 'c' that launched us (or any held
-                                        // key) can't fire an instant exit on entry.
+    uint32_t peek_until       = 0;    // 0 = screen asleep; else millis() when it re-sleeps
+    bool     need_redraw      = false;
+    bool     key_armed        = false;  // require one release before input acts, so the
+                                        // 'c' that launched us can't fire instantly.
 
-    // The screen stays lit (dimly) the whole time so the voltage is always
-    // readable. The backlight is the largest remaining load, so it runs at the
-    // dim ambient level with the CPU held at 40 MHz; every other begin()-powered
-    // load (RGB LED, speaker amp, IMU, radios) is cut. We deliberately do NOT
-    // light-sleep the core between samples: the backlight PWM's clock gets gated
-    // in light sleep, so the brightness wouldn't hold steady — and a stable,
-    // readable screen is the whole point of keeping it on. A plain delay paces
-    // the loop instead.
+    // ── Charge-progress tracking ─────────────────────────────────────────────
+    // The definitive "is it actually charging?" signal. On this hardware the cell
+    // climbs only ~0.5–3 mV/min (a ~60 mA TP4057 into 1750 mAh, and the LiPo mid
+    // curve is flat), so a short-window slope is pure ADC noise. We instead track
+    // the CUMULATIVE gain since entry (unambiguous over minutes) and derive an
+    // AVERAGE rate + ETA from it — conservative, stable, and honest.
+    const uint32_t charge_start_ms = millis();
+    const int32_t  start_mv        = mv;      // resting voltage when charge mode began
+    float          rate_mv_per_min = 0.0f;    // avg since entry; valid once settled
+    bool           rate_valid      = false;
+
+    // Brownout ratchet. A brownout with the cell ALREADY at/above the EXIT floor
+    // means the floor wasn't enough for this cell/charger today — resuming at the
+    // same level just replays exit -> radio surge -> brownout -> re-enter every
+    // ~10s, which reads as "frozen on the charge screen". Demand a real gain
+    // (+80mV over the current resting level) before retrying; each failed retry
+    // re-enters at a higher resting voltage, so the bar ratchets up on its own
+    // until a boot survives. Capped at 4000mV — a level any bootable pack must
+    // reach — so a dying cell can't push the target beyond the charger. A
+    // keypress still overrides at any time.
+    if (after_brownout && !user_requested) {
+        int32_t ratchet = start_mv + 80;
+        if (ratchet > 4000)      ratchet = 4000;
+        if (ratchet > resume_mv) resume_mv = ratchet;
+        Serial.printf("[CHARGE] brownout entry at %dmV -> resume target %dmV\n",
+                      (int)start_mv, (int)resume_mv);
+    }
+
     for (;;) {
         M5Cardputer.update();
+        uint32_t now       = millis();
+        bool     screen_on = (peek_until != 0);
 
         bool pressed = M5Cardputer.Keyboard.isPressed();
         if (!pressed) key_armed = true;
-        // Once armed, any fresh keypress = user override, "start the app now".
-        if (key_armed && M5Cardputer.Keyboard.isChange() && pressed) return;
-
-        int32_t raw = charge_mode_read_mv();
-        ema_mv = (ema_mv == 0.0f) ? (float)raw : (0.2f * (float)raw + 0.8f * ema_mv);
-        int32_t mv  = (int32_t)ema_mv;
-        int     pct = voltage_to_percent(mv);
-
-        // Auto-resume once the SMOOTHED cell voltage HOLDS above EXIT for a
-        // sustained window, so ripple can't bounce us into a brown-out the
-        // instant the radios load the rail on resume.
-        if (mv >= CHARGE_MODE_EXIT_MV) {
-            if (exit_stable_since == 0)                         exit_stable_since = millis();
-            else if (millis() - exit_stable_since >= 4000)      return;
-        } else {
-            exit_stable_since = 0;
+        if (key_armed && M5Cardputer.Keyboard.isChange() && pressed) {
+            if (screen_on) {
+                // Second press, while peeking -> start the app now.
+                lcd.wakeup();
+                lcd.setBrightness(AMBIENT_BRIGHTNESS);
+                return;
+            }
+            // First press -> wake for a timed peek.
+            lcd.wakeup();
+            lcd.setBrightness(AMBIENT_BRIGHTNESS);
+            delay(130);                      // ST7789 SLPOUT settle before drawing
+            peek_until  = now + PEEK_MS;
+            need_redraw = true;
         }
 
-        int32_t shown_mv = (mv / 10) * 10;   // 10mV display resolution
-        if (shown_mv != last_shown_mv || pct != last_pct) {   // redraw only on visible change
-            last_shown_mv = shown_mv; last_pct = pct;
-            uint16_t accent = (mv >= CHARGE_MODE_EXIT_MV) ? COL_GOOD : COL_LOW;
+        // Periodic cell sample + resume decision (NOT every frame).
+        if (now - last_sample_ms >= SAMPLE_MS) {
+            last_sample_ms = now;
+            int32_t raw = charge_mode_read_mv();
+            ema_mv = 0.2f * (float)raw + 0.8f * ema_mv;
+            int32_t new_mv = (int32_t)ema_mv;
+            if (new_mv != mv && peek_until != 0) need_redraw = true;  // refresh a live peek
+            mv = new_mv;
+
+            // Average charge rate since entry. Gate on a settle window so the
+            // first noisy seconds don't produce a wild slope; only trust an
+            // upward trend (a flat/negative reading = not gaining, ETA hidden).
+            uint32_t elapsed_ms = now - charge_start_ms;
+            if (elapsed_ms >= 120000) {                       // 2 min settle
+                rate_mv_per_min = (float)(mv - start_mv) / (elapsed_ms / 60000.0f);
+                rate_valid = true;
+            }
+
+            // Serial trace so charge progress is visible with the screen asleep.
+            Serial.printf("[CHARGE] t=%lus  %dmV  (+%dmV)  %s%.1f mV/min\n",
+                          (unsigned long)(elapsed_ms / 1000), (int)mv,
+                          (int)(mv - start_mv),
+                          rate_valid ? "avg " : "settling ",
+                          rate_valid ? rate_mv_per_min : 0.0f);
+            if (peek_until != 0) need_redraw = true;          // tick elapsed/ETA live
+
+            // Auto-resume once the SMOOTHED cell voltage HOLDS above the resume
+            // threshold for a sustained window, so ripple can't bounce us into a
+            // brown-out the instant the radios load the rail on resume. (resume_mv
+            // is the safe-to-run floor when auto-entered, or the full-charge
+            // target when the user requested this charge.)
+            if (mv >= resume_mv) {
+                if (exit_stable_since == 0)                    exit_stable_since = now;
+                else if (now - exit_stable_since >= 4000) {
+                    lcd.wakeup();
+                    lcd.setBrightness(AMBIENT_BRIGHTNESS);
+                    return;
+                }
+            } else {
+                exit_stable_since = 0;
+            }
+        }
+
+        // Draw the readout while a peek is active (on start, and on value change).
+        if (peek_until != 0 && need_redraw) {
+            need_redraw = false;
+            const uint16_t COL_BG   = lgfx::color565(0, 0, 0);
+            const uint16_t COL_TEXT = lgfx::color565(230, 230, 230);
+            const uint16_t COL_DIM  = lgfx::color565(120, 120, 120);
+            const uint16_t COL_GOOD = lgfx::color565(60, 210, 120);   // green: safe to resume
+            const uint16_t COL_LOW  = lgfx::color565(230, 170, 40);   // amber: still charging
+            int      pct    = voltage_to_percent(mv);
+            uint16_t accent = (mv >= resume_mv) ? COL_GOOD : COL_LOW;
+            int32_t  gain   = mv - start_mv;
+            char     line[24];
+
             lcd.fillScreen(COL_BG);
 
+            // Title.
             lcd.setTextDatum(TC_DATUM);
             lcd.setTextColor(accent, COL_BG);
-            lcd.setTextSize(2);                    // literal sizes OK here (boot-screen context)
-            lcd.drawString("CHARGING", DISP_W / 2, 14);
+            lcd.setTextSize(2);
+            lcd.drawString("CHARGING", DISP_W / 2, 4);
 
+            // Big voltage — the headline number.
             char vbuf[16];
-            snprintf(vbuf, sizeof(vbuf), "%d.%02d V", (int)(mv / 1000), (int)((mv % 1000) / 10));
+            snprintf(vbuf, sizeof(vbuf), "%d.%02dV", (int)(mv / 1000), (int)((mv % 1000) / 10));
             lcd.setTextDatum(MC_DATUM);
             lcd.setTextColor(COL_TEXT, COL_BG);
             lcd.setTextSize(4);
-            lcd.drawString(vbuf, DISP_W / 2, DISP_H / 2);
+            lcd.drawString(vbuf, DISP_W / 2, 44);
 
-            char pbuf[8];
-            snprintf(pbuf, sizeof(pbuf), "%d%%", pct);
-            lcd.setTextDatum(BC_DATUM);
+            // Percent + cumulative gain since entry (proof it's climbing), size 2.
+            snprintf(line, sizeof(line), "%d%%  %+dmV", pct, (int)gain);
             lcd.setTextColor(accent, COL_BG);
             lcd.setTextSize(2);
-            lcd.drawString(pbuf, DISP_W / 2, DISP_H - 26);
+            lcd.drawString(line, DISP_W / 2, 80);
 
+            // Measured rate only — NO time-to-full estimate. Voltage rise can't be
+            // extrapolated to a finish time on this hardware (early load-rebound
+            // inflates it, the CV taper near the top balloons it, and there's no
+            // current-sense to coulomb-count), so any ETA is garbage. Show the raw
+            // mV/min instead: a measurement, not a promise. It's the average since
+            // entry, so it reads a touch high until the rebound washes out.
+            if (rate_valid && rate_mv_per_min > 0.2f) {
+                snprintf(line, sizeof(line), "+%.1f mV/min", rate_mv_per_min);
+                lcd.setTextColor(COL_TEXT, COL_BG);
+            } else if (rate_valid) {
+                snprintf(line, sizeof(line), "stalled-check USB");
+                lcd.setTextColor(COL_LOW, COL_BG);
+            } else {
+                snprintf(line, sizeof(line), "measuring...");
+                lcd.setTextColor(COL_DIM, COL_BG);
+            }
+            lcd.setTextSize(2);
+            lcd.drawString(line, DISP_W / 2, 106);
+
+            // Footer hint (small — instruction, not data).
+            lcd.setTextDatum(BC_DATUM);
             lcd.setTextColor(COL_DIM, COL_BG);
             lcd.setTextSize(1);
-            lcd.drawString("radios off  -  any key to start", DISP_W / 2, DISP_H - 8);
+            lcd.drawString("press again to start", DISP_W / 2, DISP_H - 2);
         }
 
-        delay(500);
+        // Peek expired -> put the screen back to sleep.
+        if (peek_until != 0 && now >= peek_until) {
+            peek_until = 0;
+            lcd.setBrightness(0);
+            lcd.sleep();
+        }
+
+        delay(peek_until != 0 ? 30 : 100);   // snappy while peeking, relaxed when dark
     }
 }
 
@@ -10334,7 +10448,9 @@ void setup() {
                             : brownout  ? "recovering from brownout"
                                         : "battery below entry floor";
             Serial.printf("[BOOT] entering Charge Mode (%s)\n", why);
-            run_charge_mode();
+            // Only a deliberate 'c'-request tops up to full; auto entries resume
+            // at the safe-to-run floor so a low cell isn't held longer than needed.
+            run_charge_mode(requested, brownout);
             Serial.println("[BOOT] leaving Charge Mode -> normal boot");
         }
     }
