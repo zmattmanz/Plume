@@ -160,7 +160,7 @@ Export mode pauses all scanning — WiFi promiscuous mode and BLE shut down comp
 4. Username is `plume`, password is the displayed 4-character hex code (deterministic per device, derived from eFuse MAC)
 5. Download files from the web interface
 
-Export auto-exits after 10 minutes (extended while someone is downloading). Press `m` → Stop Export to exit manually. NimBLE is fully deinitialized during export to free ~20-30KB of heap for the WiFi TCP stack, then reinitialized on exit.
+Export auto-exits after 10 minutes (extended while someone is downloading). Exit manually with `esc` (the `` ` `` key, Fn not required), `del`, or `m` → Stop Export. NimBLE is fully deinitialized during export to free ~20-30KB of heap for the WiFi TCP stack, then reinitialized on exit.
 
 ### Files
 | File | What It Is |

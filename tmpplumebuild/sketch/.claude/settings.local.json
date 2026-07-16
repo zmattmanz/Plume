@@ -1,0 +1,28 @@
+#line 1 "C:\\Users\\zmatt\\Documents\\Development\\FlockDetection_Cardputer_ADV\\FlockDetection_Cardputer_ADV\\.claude\\settings.local.json"
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(git -C \"C:\\\\Users\\\\zmatt\\\\Documents\\\\Development\\\\FlockDetection_Cardputer_ADV\\\\FlockDetection_Cardputer_ADV\" status)",
+      "Bash(git -C \"C:\\\\Users\\\\zmatt\\\\Documents\\\\Development\\\\FlockDetection_Cardputer_ADV\\\\FlockDetection_Cardputer_ADV\" log --oneline -5)",
+      "Bash(git -C \"C:\\\\Users\\\\zmatt\\\\Documents\\\\Development\\\\FlockDetection_Cardputer_ADV\\\\FlockDetection_Cardputer_ADV\" add FlockDetection_Cardputer_ADV.ino)",
+      "Bash(git -C 'C:\\\\Users\\\\zmatt\\\\Documents\\\\Development\\\\FlockDetection_Cardputer_ADV\\\\FlockDetection_Cardputer_ADV' commit -m ' *)",
+      "Bash(git *)",
+      "Bash(python3 *)",
+      "Bash(python *)",
+      "Bash(sed -n '7160,7413p')",
+      "Read(//tmp/**)",
+      "Bash(bash *)",
+      "Bash(awk -F: '$2 ~ /draw_feed_expanded/ || \\($2 ~ /====/ && NR>1\\)')",
+      "Bash(Move-Item C:\\\\Users\\\\zmatt\\\\Documents\\\\Development\\\\FlockDetection_Cardputer_ADV\\\\LICENSE *)",
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\zmatt\\\\Documents\\\\Development\\\\FlockDetection_Cardputer_ADV\\\\FlockDetection_Cardputer_ADV\\\\FlockDetection_Cardputer_ADV.ino\" -ErrorAction SilentlyContinue | Select-Object FullName, @{Name='SizeKB';Expression={[math]::Round\\($_.Length/1KB, 2\\)}})",
+      "Bash(powershell -Command \"Select-String -Path 'FlockDetection_Cardputer_ADV.ino' -Pattern 'void export_mode_start\\\\\\(\\\\\\)|void export_restore_promiscuous\\\\\\(\\\\\\)|last_ble_restart_ms|xQueueReset|NimBLEDevice::deinit|uint8_t buf\\\\[1024\\\\]' | Select-Object LineNumber, Line\")",
+      "Bash(powershell -Command \"Select-String -Path 'FlockDetection_Cardputer_ADV.ino' -Pattern 'void export_mode_start' | Select-Object LineNumber, Line\")",
+      "Bash(powershell -Command \"Select-String -Path 'FlockDetection_Cardputer_ADV.ino' -Pattern 'export_mode_start' | Select-Object LineNumber, Line\")",
+      "Bash(powershell -Command \"Select-String -Path 'FlockDetection_Cardputer_ADV.ino' -Pattern 'xQueueReset|NimBLEDevice::deinit' | Select-Object LineNumber, Line\")",
+      "Bash(findstr *)"
+    ]
+  }
+}

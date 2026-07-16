@@ -36,16 +36,6 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// Boot stage personalities — must be defined before any function that returns
-// it, including Arduino's auto-generated forward declarations near the top of
-// the translation unit.
-enum BootPersonality {
-    BOOT_NORMAL,   // smooth advance, brief settle
-    BOOT_LURCH,    // overshoot target slightly, settle back
-    BOOT_RUSH,     // fast advance, no settle dwell
-    BOOT_STALL,    // pause near target, then snap home
-};
-
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
@@ -6084,34 +6074,49 @@ static void menu_draw_icon(int flat_idx, int x, int y, uint16_t col) {
     }
 }
 
+// Animated title-card grid. Shared by the content sprite and the boot-time
+// header strip: the spacing (20) equals CONTENT_Y, so the same off_x/off_y
+// values produce one continuous grid across the two canvases.
+static void draw_title_grid(lgfx::LovyanGFX& g, int h, float alpha) {
+    uint16_t grid_col = lerp_col16(BG_COLOR, HEADER_COLOR, alpha * 0.16f);
+    const int spacing = 20;
+
+    static float grid_dx = 0.0f, grid_dy = 0.0f;
+    static bool grid_dir_set = false;
+    if (!grid_dir_set) {
+        // Random diagonal with both components guaranteed visible: random
+        // sign, 12-22 px/s per axis — a slow glide, roughly one grid cell
+        // per second. (cos/sin of a random angle could land near an axis
+        // and read as static.)
+        grid_dx = (random(0, 2) ? 1.0f : -1.0f) * (12.0f + (float)random(0, 11));
+        grid_dy = (random(0, 2) ? 1.0f : -1.0f) * (12.0f + (float)random(0, 11));
+        grid_dir_set = true;
+    }
+
+    // Offsets are recomputed at most every 25ms and cached, so the two
+    // canvases drawn within one frame always share identical offsets — no
+    // 1px seam at the strip boundary. At <=22 px/s the position never moves
+    // more than 1px per 25ms window, so caching costs no smoothness.
+    static unsigned long grid_calc_ms = 0;
+    static int off_x = 0, off_y = 0;
+    unsigned long now = millis();
+    if (grid_calc_ms == 0 || now - grid_calc_ms >= 25) {
+        float t = (float)now / 1000.0f;
+        off_x = ((int)(t * grid_dx) % spacing + spacing) % spacing;
+        off_y = ((int)(t * grid_dy) % spacing + spacing) % spacing;
+        grid_calc_ms = now;
+    }
+
+    for (int y = off_y - spacing; y < h; y += spacing)
+        g.drawFastHLine(0, y, DISP_W, grid_col);
+    for (int x = off_x - spacing; x < DISP_W; x += spacing)
+        g.drawFastVLine(x, 0, h, grid_col);
+}
+
 static void draw_title_card_impl(lgfx::LovyanGFX& g, float alpha, int h) {
     if (alpha <= 0.01f) return;
 
-    // ── Animated grid background ──
-    {
-        float grid_alpha = alpha * 0.16f;
-        uint16_t grid_col = lerp_col16(BG_COLOR, HEADER_COLOR, grid_alpha);
-
-        int spacing = 20;
-
-        static float grid_dx = 0.0f, grid_dy = 0.0f;
-        static bool grid_dir_set = false;
-        if (!grid_dir_set) {
-            float angle = (float)random(0, 628) / 100.0f;
-            grid_dx = cosf(angle) * 14.0f;
-            grid_dy = sinf(angle) * 14.0f;
-            grid_dir_set = true;
-        }
-
-        float t = (float)millis() / 1000.0f;
-        int off_x = ((int)(t * grid_dx) % spacing + spacing) % spacing;
-        int off_y = ((int)(t * grid_dy) % spacing + spacing) % spacing;
-
-        for (int y = off_y - spacing; y < h; y += spacing)
-            g.drawFastHLine(0, y, DISP_W, grid_col);
-        for (int x = off_x - spacing; x < DISP_W; x += spacing)
-            g.drawFastVLine(x, 0, h, grid_col);
-    }
+    draw_title_grid(g, h, alpha);
 
     // ── Pill with title ──
     g.setTextSize(2);
@@ -6124,7 +6129,11 @@ static void draw_title_card_impl(lgfx::LovyanGFX& g, float alpha, int h) {
     int pill_h = title_h + pad_y;
     int pill_r = pill_h / 2;
     int pill_x = (DISP_W - pill_w) / 2;
-    int pill_y = (h - pill_h) / 2 - 6;
+    // Centered in FULL-SCREEN coordinates (the boot-time strip canvas
+    // extends the card to y=0), then shifted into the content sprite's
+    // local space. Centering within the sprite's own height sat the card
+    // ~11px below screen center once the grid covered the whole screen.
+    int pill_y = (DISP_H - pill_h) / 2 - 6 - CONTENT_Y;
 
     uint16_t pill_fill  = lerp_col16(BG_COLOR, lerp_col16(BG_COLOR, HEADER_COLOR, 0.15f), alpha);
     uint16_t border_col = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
@@ -6154,7 +6163,6 @@ static void draw_title_card_impl(lgfx::LovyanGFX& g, float alpha, int h) {
     g.setTextDatum(TL_DATUM);
 }
 static void draw_title_card_overlay(float alpha) { draw_title_card_impl(spr, alpha, SPR_H); }
-static void draw_title_card_overlay_lcd(float alpha) { draw_title_card_impl(M5Cardputer.Display, alpha, DISP_H); }
 
 static void draw_title_card() {
     unsigned long elapsed = millis() - title_card_start_ms;
@@ -9780,7 +9788,9 @@ static int boot_prev_pct = -1;
 static float boot_eased_fill = 0.0f;
 static bool boot_first_draw = true;
 static int boot_prev_fill_w = 0;
-static char  boot_prev_digits[8]          = "";
+static char  boot_drawn_digits[8]          = "";   // glyph actually on the LCD, per cell
+static int   boot_drawn_x[8]               = {0};  // x it was drawn at (layout can reflow)
+static int   boot_drawn_y[8]               = {0};  // y it was drawn at (slides during rolls)
 static unsigned long boot_digit_anim_ms[8] = {0};
 
 void draw_boot_screen(int pct, const char* status_text = nullptr) {
@@ -9810,12 +9820,11 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     const int status_y = num_y + num_h + 13 + 20 + 18;  // = 97
     const int status_h = 8;
 
-    // ── Staggered intro — each element fades in at its own offset ──
+    // ── Staggered intro — each element appears at its own offset ──
     // Sequence (offsets relative to first call):
-    //   0ms   → screen filled, layout starts blank
-    //   0ms   → title begins fading in (+slide down) over 350ms
-    //   220ms → bar outline begins drawing over 350ms
-    //   500ms → percentage + status text begin allowed to render
+    //   0ms            → screen filled, layout starts blank
+    //   UI_ANIM_QUICK  → bar outline reveals left-to-right over UI_ANIM_NORMAL
+    //   UI_ANIM_SLOW   → percentage + status text + bar fill allowed to render
     static unsigned long boot_intro_start_ms = 0;
     static int           boot_outline_drawn_to = 0;  // pixels of outline drawn so far
 
@@ -9865,12 +9874,10 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     }
 
     // ── Percentage — digits roll individually, % symbol stays static ──
-    // Each digit gets its own clipped redraw window. The % symbol is drawn
-    // once on first frame (when boot_first_draw cleared the screen) and
-    // never touched again — no flicker, no movement.
+    // Each digit gets its own clipped redraw window. The % symbol is only
+    // redrawn when the digit count reflows its position — otherwise it is
+    // never touched: no flicker, no movement.
     //
-    // Per-digit independence: when pct changes, only digits whose VALUE
-    // changed get a new animation start time. Unchanged digits stay still.
     // Each digit's redraw is its own startWrite/endWrite transaction so the
     // SPI burst is small and atomic.
     {
@@ -9894,14 +9901,12 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             for (int di = 0; di < n_chars - 1 && di < 8; di++) {
                 boot_digit_anim_ms[di] = now_t;
             }
-            strncpy(boot_prev_digits, pct_str, sizeof(boot_prev_digits) - 1);
-            boot_prev_digits[sizeof(boot_prev_digits) - 1] = '\0';
             boot_prev_pct = pct;
         }
 
-        // Fast roll — must complete well within the shortest boot stage
-        // (BOOT_RUSH approach_max_ms = 120) so digits are never caught
-        // mid-animation by a phase transition.
+        // Fast roll — must complete within boot_animate's 120ms animation
+        // window so digits are never caught mid-animation by a milestone
+        // transition.
         const unsigned long ROLL_MS = 100;
 
         // Draw the % symbol whenever its position needs to change (which
@@ -9925,11 +9930,15 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             pct_symbol_x = new_pct_x;
         }
 
-        // Always render every digit every frame — settled or animating.
-        // The previous skip-if-settled path left a digit mid-roll on the
-        // LCD if a personality reset the animation before the roll
-        // completed; without a redraw the digit would freeze in place
-        // (this is what produced the "hung digit" boot bug).
+        // Redraw a digit only when what would land on the LCD differs from
+        // what is already there (glyph, x after a layout reflow, or slide y).
+        // Settled digits are no-ops — the old draw-every-frame loop wiped and
+        // repainted each cell at ~60fps, and the panel's async refresh kept
+        // catching the wiped state (the boot-screen shimmer). Tracking the
+        // actually-drawn state also preserves the "hung digit" fix the
+        // every-frame loop existed for: a digit whose roll was cut short
+        // still mismatches its settled position, so it gets one final
+        // corrective draw instead of freezing mid-roll.
         for (int di = 0; di < n_chars - 1 && di < 8; di++) {
             int dx = start_x + di * char_w;
             int draw_y = num_y;  // default: settled position
@@ -9938,14 +9947,28 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
                 (long)(now_t - boot_digit_anim_ms[di]) >= 0) {
                 unsigned long elapsed = now_t - boot_digit_anim_ms[di];
                 if (elapsed < ROLL_MS) {
-                    draw_y = anim_slide_in(num_y, num_h, boot_digit_anim_ms[di], ROLL_MS);
+                    // Half-cell slide: a full num_h offset started the glyph
+                    // entirely outside the clip rect, so every roll opened
+                    // with a blank cell — read as the digit blinking out.
+                    draw_y = anim_slide_in(num_y, num_h / 2, boot_digit_anim_ms[di], ROLL_MS);
                 }
                 // else: animation complete — draw_y stays at num_y
             }
 
+            if (boot_drawn_digits[di] == pct_str[di] &&
+                boot_drawn_x[di] == dx && boot_drawn_y[di] == draw_y) {
+                continue;
+            }
+
+            // Every pixel in the cell is written exactly once: bg fill for
+            // the strip above the glyph (old digit remnant during a roll),
+            // opaque glyph for everything below. Never wipe-then-repaint —
+            // the panel can't catch an empty cell mid-frame.
             lcd.startWrite();
             lcd.setClipRect(dx, num_y, char_w, num_h);
-            lcd.fillRect(dx, num_y, char_w, num_h, bg);
+            if (draw_y > num_y) {
+                lcd.fillRect(dx, num_y, char_w, draw_y - num_y, bg);
+            }
             lcd.setTextColor(white, bg);
             lcd.setTextSize(2);
             lcd.setTextDatum(TL_DATUM);
@@ -9953,6 +9976,10 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             lcd.drawString(ch, dx, draw_y);
             lcd.clearClipRect();
             lcd.endWrite();
+
+            boot_drawn_digits[di] = pct_str[di];
+            boot_drawn_x[di]      = dx;
+            boot_drawn_y[di]      = draw_y;
         }
     }
 
@@ -9976,8 +10003,8 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
 
         // Boot bar fill matches the digit roll duration (100ms) so both
-        // animations land together. Must be <= BOOT_RUSH approach_max_ms
-        // (120ms) so even the fastest personality fully resolves.
+        // animations land together. Must be <= boot_animate's 120ms window
+        // so the fill fully resolves before the next milestone.
         static const unsigned long BOOT_BAR_FILL_MS = 100;
         float ease = ui_progress(fill_anim_start, BOOT_BAR_FILL_MS);
         boot_eased_fill = (float)fill_anim_from + (float)(fill_anim_to - fill_anim_from) * ease;
@@ -10062,88 +10089,23 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     lcd.setTextDatum(TL_DATUM);
 }
 
-// Boot stage personalities — selected randomly per call to give each
-// boot slightly different pacing. Smoothness within a stage stays at
-// ~60fps; only the dwell-after-target and the bar's approach curve vary.
-// (enum BootPersonality is defined near the top of the file so Arduino's
-// auto-generated forward declarations can see it.)
-static BootPersonality pick_boot_personality() {
-    int roll = random(0, 100);
-    if (roll < 65) return BOOT_NORMAL;
-    if (roll < 85) return BOOT_LURCH;
-    if (roll < 95) return BOOT_RUSH;
-    return BOOT_STALL;
-}
-
-// Drive the boot screen until the bar fill reaches the target percentage,
-// then hold for a personality-dependent dwell. Frames render at ~60fps
-// (16ms each) with no per-frame jitter — smoothness is deliberate.
-//
-// draw_boot_screen eases the bar fill internally (UI_ANIM_NORMAL re-target
-// whenever target_fill changes), so personality variations modify the
-// *target* the renderer sees rather than the per-frame motion. LURCH
-// retargets to an overshoot pct, lets the renderer ease there, then
-// retargets to the real value — the eye sees a smooth bounce.
+// Drive the boot screen to the target percentage. Renders ~60fps frames
+// just long enough for the renderer's internal eased animations (bar fill
+// 100ms, digit roll 100ms, status slide 120ms) to land, then returns so
+// real boot work continues immediately. The old "boot personality" system
+// (random overshoots, stalls, post-target dwells) added several seconds of
+// pure pacing theater per boot and is gone.
 //
 // The third parameter is retained as `int = 0` so existing call sites that
 // passed a frame count keep compiling; the value is ignored.
 static void boot_animate(int pct, const char* status, int /*unused*/ = 0) {
-    BootPersonality p = pick_boot_personality();
-
-    int   final_pct        = pct;
-    int   intermediate_pct = pct;
-    unsigned long approach_max_ms;
-    unsigned long settle_ms;
-
-    switch (p) {
-        case BOOT_RUSH:
-            approach_max_ms = 120;
-            settle_ms       = 0;
-            break;
-        case BOOT_LURCH:
-            intermediate_pct = pct + random(3, 6);
-            if (intermediate_pct > 100) intermediate_pct = 100;
-            approach_max_ms = 200;
-            settle_ms       = 100;
-            break;
-        case BOOT_STALL:
-            intermediate_pct = pct;
-            approach_max_ms = 400;
-            settle_ms       = 0;
-            break;
-        case BOOT_NORMAL:
-        default:
-            approach_max_ms = 180;
-            settle_ms       = 60;
-            break;
-    }
-
-    // Phase 1: drive frames at ~60fps until the approach window expires.
-    // The renderer eases the bar toward intermediate_pct internally.
-    unsigned long phase_start = millis();
+    const unsigned long ANIM_WINDOW_MS = 120;  // longest internal animation
+    unsigned long start = millis();
     bool first_frame = true;
-    while (millis() - phase_start < approach_max_ms) {
-        draw_boot_screen(intermediate_pct, first_frame ? status : nullptr);
+    while (millis() - start < ANIM_WINDOW_MS) {
+        draw_boot_screen(pct, first_frame ? status : nullptr);
         first_frame = false;
         delay(16);
-    }
-
-    // Phase 2 (LURCH only): settle from overshoot back to the real target.
-    if (p == BOOT_LURCH && intermediate_pct != final_pct) {
-        unsigned long settle_start = millis();
-        while (millis() - settle_start < 120) {
-            draw_boot_screen(final_pct, nullptr);
-            delay(16);
-        }
-    }
-
-    // Phase 3: brief dwell so the eye registers the new value.
-    if (settle_ms > 0) {
-        unsigned long settle_start = millis();
-        while (millis() - settle_start < settle_ms) {
-            draw_boot_screen(final_pct, nullptr);
-            delay(16);
-        }
     }
 }
 
@@ -10826,7 +10788,6 @@ void setup() {
     scanner_ready = true;
 
     boot_animate(100, "ready");
-    delay(400);
 
     // Gate: wait for the WiFi sniffer to confirm radios are up (~15 packets) or
     // 4 seconds, whichever comes first. Pump event queues during the wait so the
@@ -10879,15 +10840,56 @@ void setup() {
             }
         }
 
-        // Phase 2: Draw title card on dark background, fade in
-        {
+        // The content sprite only covers y=CONTENT_Y..DISP_H, so during the
+        // title card the top 20px would sit empty — a visible dead band where
+        // the grid lines stop. A small throwaway canvas carries the grid
+        // across that strip; grid spacing == CONTENT_Y, so the two canvases
+        // tile into one seamless full-screen grid. Freed before the phase-4
+        // dissolve, where the real header takes the strip over.
+        M5Canvas title_strip(&M5Cardputer.Display);
+        title_strip.setColorDepth(16);
+        bool have_strip = (title_strip.createSprite(DISP_W, CONTENT_Y) != nullptr);
+
+        // Pushes the composed title-card frame without render_frame() so the
+        // header is not drawn during the card — it first appears with the
+        // scanner during the phase-4 dissolve. Same DMA push as
+        // render_frame, minus the header drawing.
+        auto push_title_frame = [&]() {
             auto& lcd = M5Cardputer.Display;
-            lcd.fillScreen(BG_COLOR);
-            draw_title_card_overlay_lcd(1.0f);
+            if (have_strip) {
+                title_strip.fillSprite(BG_COLOR);
+                draw_title_grid(title_strip, CONTENT_Y, 1.0f);
+            }
+            lcd.startWrite();
+            if (have_strip) {
+                uint16_t* sbuf = (uint16_t*)title_strip.getBuffer();
+                if (sbuf) {
+                    lcd.pushImageDMA(0, 0, DISP_W, CONTENT_Y,
+                                     (lgfx::swap565_t*)sbuf);
+                }
+            }
+            uint16_t* buf = (uint16_t*)spr.getBuffer();
+            if (buf) {
+                lcd.pushImageDMA(0, CONTENT_Y, DISP_W, SPR_H,
+                                 (lgfx::swap565_t*)buf);
+            }
+            lcd.endWrite();
+        };
+
+        // Phase 2: Compose the title card through the sprite pipeline and
+        // fade the backlight in. Same geometry as the dissolve in phase 4 —
+        // previously this drew direct to the LCD centered in the full 135px
+        // screen while phase 4 drew via the 115px content sprite, so the
+        // card jumped ~10px at the phase boundary.
+        {
+            M5Cardputer.Display.fillScreen(BG_COLOR);
 
             int steps = 12;
             for (int i = 1; i <= steps; i++) {
                 float t = (float)i / (float)steps;
+                spr.fillSprite(BG_COLOR);
+                draw_title_card_overlay(1.0f);
+                push_title_frame();
                 M5Cardputer.Display.setBrightness((uint8_t)(start_brightness * t));
                 delay(25);
             }
@@ -10908,22 +10910,35 @@ void setup() {
         }
         M5Cardputer.Speaker.setVolume(is_muted ? 0 : current_volume);
 
-        // Phase 3: Hold on title card (~2 seconds)
+        // Phase 3: Hold on title card (~2 seconds). Rendered through the
+        // sprite pipeline — the old direct-to-LCD fillScreen + full redraw
+        // at 33fps let the panel refresh catch the blank frame constantly,
+        // which flickered and made the drifting grid read as the whole card
+        // sliding in diagonally.
         {
-            auto& lcd = M5Cardputer.Display;
             unsigned long hold_start = millis();
             while (millis() - hold_start < 2000) {
                 M5Cardputer.update();
                 process_wifi_event_queue();
                 feed_commit_pending();
-                lcd.fillScreen(BG_COLOR);
-                draw_title_card_overlay_lcd(1.0f);
-                delay(30);
+                spr.fillSprite(BG_COLOR);
+                draw_title_card_overlay(1.0f);
+                push_title_frame();
+                delay(16);
             }
         }
 
+        // The dissolve renders through render_frame(), which owns the header
+        // strip from here on — the grid strip canvas is no longer needed.
+        title_strip.deleteSprite();
+
         // Phase 4: Dissolve dark → scanner over 1 second
         {
+            // The dissolve draws the card itself below — clear
+            // title_card_active so draw_current_screen() doesn't paint a
+            // second copy at its own (different) alpha timeline, which also
+            // left the card popping off half-faded when the dissolve ended.
+            title_card_active = false;
             title_card_start_ms = millis();
             unsigned long dissolve_start = millis();
             unsigned long dissolve_ms = 1000;
@@ -10950,7 +10965,6 @@ void setup() {
         }
 
         // Phase 5: Clean transition to normal operation
-        title_card_active = false;
         draw_current_screen();
         render_frame();
     }
@@ -11500,6 +11514,13 @@ static void handle_keyboard_input() {
 
             if (c == '\n' || c == '\r') enter_consumed = true;
 
+            // The keyboard never emits ASCII ESC on its own: the key labeled
+            // "esc" is the '`' key, and the library reports it as '`' with
+            // status.fn set when the Fn chord is held. Translate the chord
+            // here so every `c == 0x1B` handler below actually fires —
+            // without this they are all dead code.
+            if (status.fn && c == '`') c = 0x1B;
+
             // ── WiFi Config input intercept ──
             // When the wifi config overlay is open, all keys are routed here.
             // In editing mode, printable chars feed the active text buffer.
@@ -11667,7 +11688,14 @@ static void handle_keyboard_input() {
                 }
             }
             else if (c == '`') {
-                if (is_muted) {
+                // This key is labeled "esc" — during export it must act like
+                // one, Fn chord or not. The footer promises "ESC stop export";
+                // without this, pressing the esc key just toggled mute.
+                if (export_mode_active || export_connecting) {
+                    export_mode_stop();
+                    screen_dirty = true;
+                }
+                else if (is_muted) {
                     is_muted = false;
                     if (current_volume == 0) current_volume = 75;
                     M5Cardputer.Speaker.setVolume(current_volume);
@@ -12151,6 +12179,12 @@ static void handle_keyboard_input() {
                 hist_detail_open = false;
                 screen_dirty = true;
                 draw_current_screen(); render_frame();
+            } else if (export_mode_active || export_connecting) {
+                // DEL is the universal "close / go back" — export mode is a
+                // thing to close. Without this (and with ESC previously dead)
+                // the only exit was menu -> Stop Export.
+                export_mode_stop();
+                screen_dirty = true;
             } else if (current_screen != 0) {
                 // Nothing to close — go home to scanner
                 transition_screen(0, -1);

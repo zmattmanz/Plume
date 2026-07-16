@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "..\\..\\..,..\\..,..\\..,..\\..",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:m5stack_cardputer:PartitionScheme=huge_app",
+  "hardwareFolders": "C:\\Users\\zmatt\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.10,C:\\Users\\zmatt\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.10",
+  "otherLibrariesFolders": "C:\\Users\\zmatt\\Documents\\Arduino\\libraries",
+  "sketchLocation": "C:\\Users\\zmatt\\Documents\\Development\\FlockDetection_Cardputer_ADV\\FlockDetection_Cardputer_ADV"
+}
