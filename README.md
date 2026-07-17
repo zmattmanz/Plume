@@ -107,6 +107,7 @@ Cards: Session Detections / Lifetime Detections, WiFi / BLE / Raven, Session Upt
 | `n` | Toggle night mode |
 | `b` | Cycle brightness (dim / mid / full) |
 | `s` | Toggle stealth mode (screen nearly off) |
+| `c` | Charge Mode — reboot into radios-off charging with a live status screen (press any key to start the app) |
 | `f` | Toggle expanded feed overlay |
 | `t` | Target device for signal tracking |
 | `l` | Clear signal target |
@@ -135,6 +136,7 @@ Press `m`. Navigate with up/down, select with Enter.
 - Low Power Mode — 80 MHz CPU, reduced BLE scan duty (50%), longer battery life. Mutually exclusive with turbo.
 - Mute Beeps — silences all tones
 - Turbo Mode — 240 MHz CPU, faster channel hopping (150ms vs 250ms), 30-second dedup window (vs 5 minutes). Mutually exclusive with low power.
+- Charge Mode — reboots into a radios-off charging state with a live percent/voltage readout (same as the `c` key)
 
 **Tools:**
 - WiFi Config — set SSID and password for export mode (AES-encrypted on flash)

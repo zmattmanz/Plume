@@ -201,6 +201,7 @@ static const MRow MENU_ROWS[] = {
     {1,  7, "Mute Beeps"},
     {1,  8, "Turbo Mode"},
     {1, 12, "5GHz Radio"},
+    {1, 13, "Charge Mode"},
     {2, -1, ""},
     {0, -1, "ACTIONS"},
     {1,  9, "WiFi Config"},
@@ -209,7 +210,7 @@ static const MRow MENU_ROWS[] = {
 };
 static const int MENU_ROW_COUNT = sizeof(MENU_ROWS) / sizeof(MENU_ROWS[0]);
 
-static_assert(MENU_ROW_COUNT == 18, "MENU_ROWS changed — update this guard and verify handle_menu_select() cases match");
+static_assert(MENU_ROW_COUNT == 19, "MENU_ROWS changed — update this guard and verify handle_menu_select() cases match");
 
 static int menu_next_idx(int cur, int dir) {
     int pos = -1;
@@ -1577,37 +1578,38 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
     auto& lcd = M5Cardputer.Display;
     lcd.setRotation(1);
 
-    // Kill the screen for the fastest charge. setBrightness(0) drops the backlight
-    // (by far the largest load) and sleep() puts the ST7789 controller to ~uA.
-    // There is deliberately NO LED indicator here: the WS2812 is powered off the
-    // backlight boost rail (GPIO 38 PWM) and only lights at full brightness, which
-    // would make it the single biggest load — useless for charging. So the panel
-    // stays dead-dark until the user asks to peek. Every exit path restores the
-    // panel (wakeup + brightness) so normal boot inherits a live display.
-    lcd.setBrightness(0);
-    lcd.sleep();
+    // Screen stays ON (dim) so charge progress is always visible. The dim
+    // backlight is a real but modest load — charging runs a bit slower than a
+    // dark panel would, and the brownout ratchet still guards the exit. There
+    // is deliberately NO LED indicator: the WS2812 is powered off the backlight
+    // boost rail (GPIO 38 PWM) and only lights at full brightness, which would
+    // make it the single biggest load — useless for charging.
+    lcd.wakeup();
+    // Brightness 30: floor. Measured slope stayed flat-to-negative at 60, 48,
+    // 43, 39, 35, 33 alike — proof the backlight was never the limiter. The
+    // real cuttable load left is the backlight's DUTY (it's on 100% of the
+    // time); dropping the level a few points saves ~1mA and won't close a real
+    // gap. Below the app's own dim tier (40) and into the PWM-flicker range.
+    lcd.setBrightness(30);
 
     // Cut the other begin()-powered loads not needed to charge.
     set_cardputer_led(0, 0, 0);              // LED off (its rail is down with the screen anyway)
     M5Cardputer.Speaker.end();               // power down the I2S amp (setVolume(0) only mutes)
 
-    // ── Screen-off charging with on-demand peek ──────────────────────────────
-    // Passive draw is ~nil (backlight off, panel asleep) so the cell charges as
-    // fast as the hardware allows. Pressing any key wakes the screen for PEEK_MS
-    // to show voltage/%, then it sleeps again. A SECOND press while the readout is
-    // up is the "start the app now" override — so an accidental single tap only
-    // peeks and can't boot a depleted cell straight into the radios.
-    const uint32_t PEEK_MS   = 3000;
+    // ── Always-on charging readout ───────────────────────────────────────────
+    // The readout stays on screen the whole time; pressing any key starts the
+    // app immediately.
     const uint32_t SAMPLE_MS = 1000;
 
     int32_t  mv               = charge_mode_read_mv();   // prime a valid reading
     float    ema_mv           = (float)mv;
     uint32_t last_sample_ms   = millis();
     uint32_t exit_stable_since = 0;   // 0 = not currently above EXIT threshold
-    uint32_t peek_until       = 0;    // 0 = screen asleep; else millis() when it re-sleeps
-    bool     need_redraw      = false;
     bool     key_armed        = false;  // require one release before input acts, so the
                                         // 'c' that launched us can't fire instantly.
+    int      press_frames     = 0;      // consecutive frames with a key down: early-boot
+                                        // matrix scans can report 1-frame phantom presses,
+                                        // which must not "start the app" out of charge mode.
 
     // ── Charge-progress tracking ─────────────────────────────────────────────
     // The definitive "is it actually charging?" signal. On this hardware the cell
@@ -1637,26 +1639,51 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
                       (int)start_mv, (int)resume_mv);
     }
 
+    // L1c palette (hardcoded: this runs before the runtime palette exists) and
+    // gauge geometry, shared by the static redraw and the shimmer animation.
+    const uint16_t COL_BG    = lgfx::color565(0, 0, 0);
+    const uint16_t COL_TEXT  = lgfx::color565(255, 255, 255);
+    const uint16_t COL_TRACK = lgfx::color565(32, 36, 44);
+    const uint16_t COL_GOOD  = lgfx::color565(60, 210, 120);  // green: safe to resume
+    const uint16_t COL_LOW   = lgfx::color565(230, 170, 40);  // amber: still charging
+    const int PAD = 14;   // one shared margin: left edge of every element, plus
+                          // the title's top gap and the footer's bottom gap.
+    const int GAUGE_X = PAD, GAUGE_Y = 80, GAUGE_W = 150, GAUGE_H = 5, GAUGE_R = 2;
+    uint32_t last_anim_ms = 0;
+    bool     ui_safe      = (mv >= resume_mv);  // accent state (hysteresis below)
+    bool     chrome_stale = true;               // full repaint on entry / safe flip
+    int32_t  drawn_mv     = -1;                 // mv the value strips show (-1 = stale)
+
+    // Every dynamic element renders into its own small sprite and lands as ONE
+    // blit, so the panel never shows a cleared-but-not-yet-redrawn state (the
+    // flicker source). ~15KB total, trivial against boot-gate heap.
+    const int HERO_W = 92,  HERO_H = 32;   // "100" at size 4 + '%' at size 2
+    const int VOLT_W = 176, VOLT_H = 16;   // "4.06V  +1234mV" at size 2
+    const int BOLT_W = 13,  BOLT_H = 15;   // 12x14 polygon + 1px slack
+    M5Canvas gauge_spr(&lcd), bolt_spr(&lcd), hero_spr(&lcd), volt_spr(&lcd);
+    gauge_spr.setColorDepth(16); bolt_spr.setColorDepth(16);
+    hero_spr.setColorDepth(16);  volt_spr.setColorDepth(16);
+    bool spr_ok = gauge_spr.createSprite(GAUGE_W, GAUGE_H)
+               && bolt_spr.createSprite(BOLT_W, BOLT_H)
+               && hero_spr.createSprite(HERO_W, HERO_H)
+               && volt_spr.createSprite(VOLT_W, VOLT_H);
+    Serial.printf("[CHARGE] ui L1c-v5, sprites %s\n",
+                  spr_ok ? "ok" : "FAILED (animations off)");
+
     for (;;) {
         M5Cardputer.update();
-        uint32_t now       = millis();
-        bool     screen_on = (peek_until != 0);
+        uint32_t now = millis();
 
         bool pressed = M5Cardputer.Keyboard.isPressed();
-        if (!pressed) key_armed = true;
-        if (key_armed && M5Cardputer.Keyboard.isChange() && pressed) {
-            if (screen_on) {
-                // Second press, while peeking -> start the app now.
-                lcd.wakeup();
-                lcd.setBrightness(AMBIENT_BRIGHTNESS);
-                return;
-            }
-            // First press -> wake for a timed peek.
-            lcd.wakeup();
-            lcd.setBrightness(AMBIENT_BRIGHTNESS);
-            delay(130);                      // ST7789 SLPOUT settle before drawing
-            peek_until  = now + PEEK_MS;
-            need_redraw = true;
+        if (!pressed) { key_armed = true; press_frames = 0; }
+        else if (key_armed && ++press_frames >= 2) {
+            // Real keypress (held >= 2 frames / ~60ms) -> start the app.
+            // Do NOT touch brightness here: charge mode holds one fixed level
+            // and the app's boot owns brightness afterward. Wait for release so
+            // the keystroke (e.g. 'b') can't leak into the app's keyboard
+            // handler and cycle brightness the instant we return.
+            while (M5Cardputer.Keyboard.isPressed()) { M5Cardputer.update(); delay(10); }
+            return;
         }
 
         // Periodic cell sample + resume decision (NOT every frame).
@@ -1665,7 +1692,6 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
             int32_t raw = charge_mode_read_mv();
             ema_mv = 0.2f * (float)raw + 0.8f * ema_mv;
             int32_t new_mv = (int32_t)ema_mv;
-            if (new_mv != mv && peek_until != 0) need_redraw = true;  // refresh a live peek
             mv = new_mv;
 
             // Average charge rate since entry. Gate on a settle window so the
@@ -1677,13 +1703,12 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
                 rate_valid = true;
             }
 
-            // Serial trace so charge progress is visible with the screen asleep.
-            Serial.printf("[CHARGE] t=%lus  %dmV  (+%dmV)  %s%.1f mV/min\n",
+            // Serial trace mirrors the on-screen readout (handy over USB).
+            Serial.printf("[CHARGE] t=%lus  %dmV  (%+dmV)  %s%.1f mV/min\n",
                           (unsigned long)(elapsed_ms / 1000), (int)mv,
                           (int)(mv - start_mv),
                           rate_valid ? "avg " : "settling ",
                           rate_valid ? rate_mv_per_min : 0.0f);
-            if (peek_until != 0) need_redraw = true;          // tick elapsed/ETA live
 
             // Auto-resume once the SMOOTHED cell voltage HOLDS above the resume
             // threshold for a sustained window, so ripple can't bounce us into a
@@ -1693,84 +1718,158 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
             if (mv >= resume_mv) {
                 if (exit_stable_since == 0)                    exit_stable_since = now;
                 else if (now - exit_stable_since >= 4000) {
-                    lcd.wakeup();
-                    lcd.setBrightness(AMBIENT_BRIGHTNESS);
-                    return;
+                    return;   // app boot owns brightness; charge mode never changes it
                 }
             } else {
                 exit_stable_since = 0;
             }
         }
 
-        // Draw the readout while a peek is active (on start, and on value change).
-        if (peek_until != 0 && need_redraw) {
-            need_redraw = false;
-            const uint16_t COL_BG   = lgfx::color565(0, 0, 0);
-            const uint16_t COL_TEXT = lgfx::color565(230, 230, 230);
-            const uint16_t COL_DIM  = lgfx::color565(120, 120, 120);
-            const uint16_t COL_GOOD = lgfx::color565(60, 210, 120);   // green: safe to resume
-            const uint16_t COL_LOW  = lgfx::color565(230, 170, 40);   // amber: still charging
-            int      pct    = voltage_to_percent(mv);
-            uint16_t accent = (mv >= resume_mv) ? COL_GOOD : COL_LOW;
-            int32_t  gain   = mv - start_mv;
-            char     line[24];
+        // ── Rendering ────────────────────────────────────────────────────────
+        // Chrome (title/footer) paints on entry and repaints only when the
+        // accent flips; everything dynamic lands as single sprite blits below.
+        // The accent has hysteresis: ripple around resume_mv would otherwise
+        // strobe amber<->green, and each flip repaints the whole screen.
+        // Still NO time-to-full estimate — voltage rise can't be extrapolated
+        // to a finish time on this hardware (early load-rebound inflates it,
+        // the CV taper balloons it, there's no current-sense to coulomb-count),
+        // so any ETA is garbage. (mV/min still goes to the serial trace above.)
+        if (ui_safe) { if (mv <  resume_mv - 15) { ui_safe = false; chrome_stale = true; } }
+        else         { if (mv >= resume_mv)      { ui_safe = true;  chrome_stale = true; } }
+        int      pct    = voltage_to_percent(mv);
+        uint16_t accent = ui_safe ? COL_GOOD : COL_LOW;
+
+        if (chrome_stale) {
+            chrome_stale = false;
+            drawn_mv     = -1;      // force the value strips to repaint
 
             lcd.fillScreen(COL_BG);
+            lcd.setTextDatum(TL_DATUM);
 
-            // Title.
-            lcd.setTextDatum(TC_DATUM);
+            // Title — small, wide tracking (+2px between chars at size 1).
             lcd.setTextColor(accent, COL_BG);
-            lcd.setTextSize(2);
-            lcd.drawString("CHARGING", DISP_W / 2, 4);
-
-            // Big voltage — the headline number.
-            char vbuf[16];
-            snprintf(vbuf, sizeof(vbuf), "%d.%02dV", (int)(mv / 1000), (int)((mv % 1000) / 10));
-            lcd.setTextDatum(MC_DATUM);
-            lcd.setTextColor(COL_TEXT, COL_BG);
-            lcd.setTextSize(4);
-            lcd.drawString(vbuf, DISP_W / 2, 44);
-
-            // Percent + cumulative gain since entry (proof it's climbing), size 2.
-            snprintf(line, sizeof(line), "%d%%  %+dmV", pct, (int)gain);
-            lcd.setTextColor(accent, COL_BG);
-            lcd.setTextSize(2);
-            lcd.drawString(line, DISP_W / 2, 80);
-
-            // Measured rate only — NO time-to-full estimate. Voltage rise can't be
-            // extrapolated to a finish time on this hardware (early load-rebound
-            // inflates it, the CV taper near the top balloons it, and there's no
-            // current-sense to coulomb-count), so any ETA is garbage. Show the raw
-            // mV/min instead: a measurement, not a promise. It's the average since
-            // entry, so it reads a touch high until the rebound washes out.
-            if (rate_valid && rate_mv_per_min > 0.2f) {
-                snprintf(line, sizeof(line), "+%.1f mV/min", rate_mv_per_min);
-                lcd.setTextColor(COL_TEXT, COL_BG);
-            } else if (rate_valid) {
-                snprintf(line, sizeof(line), "stalled-check USB");
-                lcd.setTextColor(COL_LOW, COL_BG);
-            } else {
-                snprintf(line, sizeof(line), "measuring...");
-                lcd.setTextColor(COL_DIM, COL_BG);
-            }
-            lcd.setTextSize(2);
-            lcd.drawString(line, DISP_W / 2, 106);
-
-            // Footer hint (small — instruction, not data).
-            lcd.setTextDatum(BC_DATUM);
-            lcd.setTextColor(COL_DIM, COL_BG);
             lcd.setTextSize(1);
-            lcd.drawString("press again to start", DISP_W / 2, DISP_H - 2);
+            {
+                int tx = PAD;
+                for (const char* p = "CHARGING MODE"; *p; p++) {
+                    char ch[2] = {*p, '\0'};
+                    lcd.drawString(ch, tx, PAD);
+                    tx += 6 + 2;
+                }
+            }
+
+            // Footer hint (instruction, not data). Bottom margin mirrors the
+            // title's PAD, but measured to the lowercase BODY: bottom-anchoring
+            // puts the 'p'/'y' descenders on the margin line, floating the body
+            // ~2px high vs the all-caps title. The +2 nudges the body down so
+            // the two visually match; descenders sit inside the margin.
+            lcd.setTextDatum(BL_DATUM);
+            lcd.setTextColor(COL_TEXT, COL_BG);
+            lcd.setTextSize(1);
+            lcd.drawString("press any key to start", PAD, DISP_H - PAD + 2);
+            lcd.setTextDatum(TL_DATUM);
+
+            // Sprite alloc failed: draw the bolt + gauge once, statically,
+            // so the screen is still complete (animations stay off).
+            if (!spr_ok) {
+                int bx = DISP_W - 14 - 12, by = 13;
+                lcd.fillTriangle(bx+7, by,    bx,    by+8,  bx+5,  by+8, accent);
+                lcd.fillTriangle(bx+7, by,    bx+5,  by+8,  bx+7,  by+6, accent);
+                lcd.fillTriangle(bx+5, by+8,  bx+5,  by+14, bx+12, by+6, accent);
+                lcd.fillTriangle(bx+5, by+8,  bx+12, by+6,  bx+7,  by+6, accent);
+                int fw = GAUGE_W * pct / 100;
+                lcd.fillRoundRect(GAUGE_X, GAUGE_Y, GAUGE_W, GAUGE_H, GAUGE_R, COL_TRACK);
+                if (fw >= GAUGE_R * 2 + 1)  lcd.fillRoundRect(GAUGE_X, GAUGE_Y, fw, GAUGE_H, GAUGE_R, accent);
+                else if (fw > 0)            lcd.fillRect(GAUGE_X, GAUGE_Y + 1, fw, GAUGE_H - 2, accent);
+            }
         }
 
-        // Peek expired -> put the screen back to sleep.
-        if (peek_until != 0 && now >= peek_until) {
-            peek_until = 0;
-            lcd.setBrightness(0);
-            lcd.sleep();
+        // Value strips — each composed off-screen and pushed as one blit,
+        // only when mv moves. All flush-left at x=14 with the rest.
+        if (mv != drawn_mv) {
+            drawn_mv = mv;
+            char line[24];
+
+            // Percent hero — size-4 number with a size-2 '%' sharing its baseline.
+            snprintf(line, sizeof(line), "%d", pct);
+            if (spr_ok) {
+                hero_spr.fillSprite(COL_BG);
+                hero_spr.setTextDatum(TL_DATUM);
+                hero_spr.setTextColor(COL_TEXT, COL_BG);
+                hero_spr.setTextSize(4);
+                hero_spr.drawString(line, 0, 0);
+                int num_w = hero_spr.textWidth(line);
+                hero_spr.setTextSize(2);
+                hero_spr.drawString("%", num_w + 3, 8 * 4 - 8 * 2);
+                hero_spr.pushSprite(PAD, 40);
+            } else {
+                lcd.fillRect(PAD, 40, HERO_W, HERO_H, COL_BG);
+                lcd.setTextColor(COL_TEXT, COL_BG);
+                lcd.setTextSize(4);
+                lcd.drawString(line, PAD, 40);
+            }
+
+            // Voltage + cumulative gain since entry (proof it's climbing).
+            snprintf(line, sizeof(line), "%d.%02dV  %+dmV",
+                     (int)(mv / 1000), (int)((mv % 1000) / 10), (int)(mv - start_mv));
+            if (spr_ok) {
+                volt_spr.fillSprite(COL_BG);
+                volt_spr.setTextDatum(TL_DATUM);
+                volt_spr.setTextColor(accent, COL_BG);
+                volt_spr.setTextSize(2);
+                volt_spr.drawString(line, 0, 0);
+                volt_spr.pushSprite(PAD, 94);
+            } else {
+                lcd.fillRect(PAD, 94, VOLT_W, VOLT_H, COL_BG);
+                lcd.setTextColor(accent, COL_BG);
+                lcd.setTextSize(2);
+                lcd.drawString(line, PAD, 94);
+            }
         }
 
-        delay(peek_until != 0 ? 30 : 100);   // snappy while peeking, relaxed when dark
+        // Animations, each a single sprite blit (no on-panel clears):
+        //   - Gauge "loading" pulse: the fill stays solid accent; a dimmer
+        //     accent segment repeatedly grows out of the fill's leading edge
+        //     (up to 16px) and resets — reads as charge flowing in at the
+        //     current level. One hue, no sweeping bands.
+        //   - Bolt pulse: breathes from near-off to full accent over 1.6s.
+        // Proof-of-life: the voltage EMA can sit unchanged for minutes on the
+        // flat of the LiPo curve; without motion the screen reads as frozen.
+        if (spr_ok && now - last_anim_ms >= 50) {
+            last_anim_ms = now;
+            const uint32_t CYCLE_MS = 1600;
+            uint32_t ph = now % CYCLE_MS;
+
+            int fw = GAUGE_W * pct / 100;
+            gauge_spr.fillSprite(COL_BG);
+            gauge_spr.fillRoundRect(0, 0, GAUGE_W, GAUGE_H, GAUGE_R, COL_TRACK);
+            if (fw >= GAUGE_R * 2 + 1)  gauge_spr.fillRoundRect(0, 0, fw, GAUGE_H, GAUGE_R, accent);
+            else if (fw > 0)            gauge_spr.fillRect(0, 1, fw, GAUGE_H - 2, accent);
+
+            const int EXT_MAX = 16;
+            int ext = (int)(ph * (EXT_MAX + 1) / CYCLE_MS);       // 0..EXT_MAX ramp
+            int x1  = fw + ext;
+            if (x1 > GAUGE_W - 1) x1 = GAUGE_W - 1;
+            if (x1 > fw)
+                gauge_spr.fillRect(fw, 1, x1 - fw, GAUGE_H - 2,
+                                   lerp_col16(COL_TRACK, accent, 0.45f));
+
+            gauge_spr.pushSprite(GAUGE_X, GAUGE_Y);
+
+            // Bolt, top-right (right edge mirrors the 14px margin).
+            // Polygon 7,0 0,8 5,8 5,14 12,6 7,6 split into two quads = four tris.
+            float    t  = (ph < CYCLE_MS / 2) ? ph / (CYCLE_MS / 2.0f)
+                                              : (CYCLE_MS - ph) / (CYCLE_MS / 2.0f);
+            uint16_t bc = lerp_col16(lerp_col16(accent, COL_BG, 0.85f), accent, t);
+            bolt_spr.fillSprite(COL_BG);
+            bolt_spr.fillTriangle(7, 0,  0, 8,   5, 8,  bc);
+            bolt_spr.fillTriangle(7, 0,  5, 8,   7, 6,  bc);
+            bolt_spr.fillTriangle(5, 8,  5, 14, 12, 6,  bc);
+            bolt_spr.fillTriangle(5, 8, 12, 6,   7, 6,  bc);
+            bolt_spr.pushSprite(DISP_W - 14 - BOLT_W, 13);
+        }
+
+        delay(30);   // keep keypress response snappy
     }
 }
 
@@ -6056,6 +6155,13 @@ static void menu_icon_trash(int x, int y, uint16_t col) {
     spr.drawFastVLine(x+6, y+3, 5, BG_COLOR);
 }
 
+static void menu_icon_charge(int x, int y, uint16_t col) {
+    spr.drawRect(x, y+2, 8, 6, col);
+    spr.drawFastVLine(x+8, y+4, 2, col);
+    spr.drawLine(x+4, y+3, x+2, y+5, col);
+    spr.drawLine(x+5, y+4, x+3, y+6, col);
+}
+
 static void menu_draw_icon(int flat_idx, int x, int y, uint16_t col) {
     switch (flat_idx) {
         case 0:  menu_icon_scanner(x, y, col);    break;
@@ -6068,6 +6174,7 @@ static void menu_draw_icon(int flat_idx, int x, int y, uint16_t col) {
         case 7:  menu_icon_mute(x, y, col);       break;
         case 8:  menu_icon_signal(x, y, col);     break;
         case 12: menu_icon_signal(x, y, col);     break;
+        case 13: menu_icon_charge(x, y, col);     break;
         case 9:  menu_icon_wifi(x, y, col);       break;
         case 10: menu_icon_export(x, y, col);     break;
         case 11: menu_icon_trash(x, y, col);      break;
@@ -6524,6 +6631,23 @@ static void set_turbo_mode(bool on) {
     screen_dirty = true;
 }
 
+// Charge Mode: reboot into the radios-off charging screen. A reboot is
+// required to actually shed the WiFi/BLE load; the RTC_NOINIT flag carries
+// the request across esp_restart() to the boot gate. Draw the confirmation
+// directly (the render loop is about to stop, so a toast would never paint).
+// Never returns.
+static void enter_charge_mode_reboot() {
+    charge_mode_request = CHARGE_MODE_MAGIC;
+    auto& lcd = M5Cardputer.Display;
+    lcd.fillScreen(lgfx::color565(0, 0, 0));
+    lcd.setTextDatum(MC_DATUM);
+    lcd.setTextColor(lgfx::color565(60, 210, 120), lgfx::color565(0, 0, 0));
+    lcd.setTextSize(2);
+    lcd.drawString("CHARGE MODE", DISP_W / 2, DISP_H / 2);
+    delay(400);
+    ESP.restart();
+}
+
 void handle_menu_select() {
     switch (menu_selected) {
         case 0: case 1: case 2: case 3: case 4: {
@@ -6571,6 +6695,14 @@ void handle_menu_select() {
             else            { c5_link_end();   set_toast_direct("5GHz RADIO OFF", TOAST_NEUTRAL); }
             schedule_persist();
             screen_dirty = true;
+            break;
+        case 13:
+            // Flush queued SD deletes synchronously before the reboot (same as
+            // export teardown). No schedule_persist(): its background task would
+            // race the restart, session stats reset on any reboot anyway, and
+            // lifetime stats have their own 60s cadence.
+            flush_pending_deletes();
+            enter_charge_mode_reboot();  // never returns
             break;
         case 9:
             show_feed_expanded = false;
@@ -11981,22 +12113,7 @@ static void handle_keyboard_input() {
                 }
             }
             else if (c == 'c') {
-                // Charge Mode: reboot into the radios-off charging screen. A
-                // reboot is required to actually shed the WiFi/BLE load; the
-                // RTC_NOINIT flag carries the request across esp_restart() to the
-                // boot gate. Draw the confirmation directly (the render loop is
-                // about to stop, so a toast would never paint).
-                if (!stealth_mode) {
-                    charge_mode_request = CHARGE_MODE_MAGIC;
-                    auto& lcd = M5Cardputer.Display;
-                    lcd.fillScreen(lgfx::color565(0, 0, 0));
-                    lcd.setTextDatum(MC_DATUM);
-                    lcd.setTextColor(lgfx::color565(60, 210, 120), lgfx::color565(0, 0, 0));
-                    lcd.setTextSize(2);
-                    lcd.drawString("CHARGE MODE", DISP_W / 2, DISP_H / 2);
-                    delay(400);
-                    ESP.restart();
-                }
+                if (!stealth_mode) enter_charge_mode_reboot();
             }
             else if (c == 'l') {
                 if (signal_active && !stealth_mode) {
