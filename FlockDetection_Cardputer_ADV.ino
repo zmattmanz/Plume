@@ -1585,12 +1585,11 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
     // boost rail (GPIO 38 PWM) and only lights at full brightness, which would
     // make it the single biggest load — useless for charging.
     lcd.wakeup();
-    // Brightness 30: floor. Measured slope stayed flat-to-negative at 60, 48,
-    // 43, 39, 35, 33 alike — proof the backlight was never the limiter. The
-    // real cuttable load left is the backlight's DUTY (it's on 100% of the
-    // time); dropping the level a few points saves ~1mA and won't close a real
-    // gap. Below the app's own dim tier (40) and into the PWM-flicker range.
-    lcd.setBrightness(30);
+    // Brightness 5: matches bmorcelli/Launcher chargeMode(), which charges this
+    // exact hardware reliably at this level. Charge SLOPE was never backlight-
+    // limited (measured flat at 60..33), but on a critically low cell the rail
+    // margin is — every mA of steady load counts toward the halt threshold.
+    lcd.setBrightness(5);   // match bmorcelli/Launcher chargeMode(); lower steady load on a marginal rail
 
     // Cut the other begin()-powered loads not needed to charge.
     set_cardputer_led(0, 0, 0);              // LED off (its rail is down with the screen anyway)
@@ -1670,8 +1669,10 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
     Serial.printf("[CHARGE] ui L1c-v5, sprites %s\n",
                   spr_ok ? "ok" : "FAILED (animations off)");
 
+    esp_task_wdt_add(NULL);   // charge loop self-recovers if it wedges
     for (;;) {
         M5Cardputer.update();
+        esp_task_wdt_reset();
         uint32_t now = millis();
 
         bool pressed = M5Cardputer.Keyboard.isPressed();
@@ -1683,6 +1684,7 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
             // the keystroke (e.g. 'b') can't leak into the app's keyboard
             // handler and cycle brightness the instant we return.
             while (M5Cardputer.Keyboard.isPressed()) { M5Cardputer.update(); delay(10); }
+            esp_task_wdt_delete(NULL);
             return;
         }
 
@@ -1718,6 +1720,7 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
             if (mv >= resume_mv) {
                 if (exit_stable_since == 0)                    exit_stable_since = now;
                 else if (now - exit_stable_since >= 4000) {
+                    esp_task_wdt_delete(NULL);
                     return;   // app boot owns brightness; charge mode never changes it
                 }
             } else {
@@ -1835,7 +1838,10 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
         //   - Bolt pulse: breathes from near-off to full accent over 1.6s.
         // Proof-of-life: the voltage EMA can sit unchanged for minutes on the
         // flat of the LiPo curve; without motion the screen reads as frozen.
-        if (spr_ok && now - last_anim_ms >= 50) {
+        // 3s step interval (was 50ms): each blit is a transient load spike on a
+        // marginal rail; ~60x fewer of them, like the Launcher's ~5s redraw.
+        // The bolt/gauge step coarsely instead of breathing — still proof-of-life.
+        if (spr_ok && now - last_anim_ms >= 3000) {
             last_anim_ms = now;
             const uint32_t CYCLE_MS = 1600;
             uint32_t ph = now % CYCLE_MS;
@@ -1869,7 +1875,7 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
             bolt_spr.pushSprite(DISP_W - 14 - BOLT_W, 13);
         }
 
-        delay(30);   // keep keypress response snappy
+        delay(80);   // gentler poll; still responsive (keys need ~2 frames)
     }
 }
 
