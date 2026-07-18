@@ -171,7 +171,7 @@ static volatile bool scanner_ready       = false;  // set true after boot; guard
 static const unsigned long TITLE_CARD_HOLD_MS = 500;   // boot sequence already did the real hold
 static const unsigned long TITLE_CARD_FADE_MS = 1000;
 static int  feed_expanded_selected = 0;
-int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
+int  brightness_level = 3;  // 0=dimmest, 1=dim, 2=mid, 3=full — cycled by 'b' key
 
 // ── WiFi Config overlay state ──
 static bool wifi_config_open = false;
@@ -286,7 +286,9 @@ static const int MENU_SECTION_COUNT = 3;
 // Low-power mode: reduces scan cadence across WiFi/BLE for longer runtime
 static bool low_power_mode = false;
 static bool turbo_mode_active = false;
-static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
+// Geometric spacing (~2x per step) reads as even perceptual jumps; 32 is the
+// old dim tier (40) lowered 20%.
+static const int BRIGHTNESS_LEVELS[4] = {32, 64, 128, 255};
 
 // Effective backlight target. The Cardputer ADV has no software-controllable
 // charger (M5Unified maps it to pmic_adc — setChargeCurrent() is a no-op), so
@@ -1064,7 +1066,7 @@ static int          history_scroll_offset = 0;
 static int   stats_scroll_target  = 0;
 static float stats_scroll_y_f     = 0.0f;
 static unsigned long stats_last_frame_ms = 0;
-static const int STATS_CONTENT_H   = 288;  // 7×36 + 7×6 gaps (no hero)
+static const int STATS_CONTENT_H   = 330;  // 8×36 + 7×6 gaps (no hero)
 static const int STATS_VIEW_H      = 115;  // DISP_H - CONTENT_Y
 static const int STATS_SCROLL_STEP = 42;   // one standard card (36) + gap (6)
 static const int STATS_MAX_SCROLL  = STATS_CONTENT_H - STATS_VIEW_H;
@@ -1081,6 +1083,7 @@ enum StatsCardIdx {
     SC_PACKETS, SC_SD,
     SC_BOOTS, SC_FLASH,
     SC_VERSION, SC_VOLTAGE,
+    SC_VDELTA,
     STATS_CARD_COUNT
 };
 // Per-character roll animation: comparing the formatted string per char
@@ -1266,12 +1269,53 @@ static bool   signal_peak_has_gps = false;
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(2);
 
+// GPS soft power control. The module's rail is hardwired on this board (no
+// cutoff), so "off" means commanding the receiver into standby over UART
+// (~2mA vs ~25-40mA acquiring). Both the CASIC form ($PCAS12 — the $GN@115200
+// module here) and the MTK form ($PMTK161) are sent; receivers ignore unknown
+// sentences. Wake is any UART byte plus an explicit standby-cancel.
+static void gps_send_nmea(const char* body) {
+    uint8_t cs = 0;
+    for (const char* p = body; *p; ++p) cs ^= (uint8_t)*p;
+    SerialGPS.printf("$%s*%02X\r\n", body, cs);
+}
+static void gps_standby(bool on) {
+    if (on) {
+        gps_send_nmea("PCAS12,65535");   // CASIC: standby, max window (~18h)
+        gps_send_nmea("PMTK161,0");      // MTK: standby until next byte
+    } else {
+        // Wake = UART traffic only. Do NOT send $PCAS12,0 — the parameter is
+        // a standby DURATION, so 0 is not "cancel"; sending it put the
+        // receiver to sleep (observed: silent at all bauds right after).
+        for (int i = 0; i < 8; i++) { SerialGPS.write((uint8_t)0xFF); delay(2); }
+    }
+}
+// Blind form for contexts where the GPS UART isn't (or may not be) up — the
+// boot charge gate runs before the baud probe. Sends at both module bauds;
+// wrong-baud garbage is ignored, and any RX edge doubles as a wake signal.
+static void gps_blind_cmd(bool standby) {
+    const uint32_t bauds[2] = {115200, 9600};
+    for (int i = 0; i < 2; i++) {
+        SerialGPS.end();
+        SerialGPS.begin(bauds[i], SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+        delay(20);
+        gps_standby(standby);
+        SerialGPS.flush();
+    }
+    SerialGPS.end();
+}
+
 // Probe common GNSS baud rates and leave SerialGPS open at the one that
 // produces valid NMEA. Returns the detected baud, or 0 if none matched
 // (caller falls back to GPS_BAUD). Tries the module default first.
 static uint32_t gps_detect_baud() {
+    // If charge mode (or a reboot out of it) left the receiver in standby it
+    // would probe silent — wake it first. Runs on every boot; harmless awake.
+    // Two sweeps: a just-woken receiver can need a moment before NMEA resumes.
+    gps_blind_cmd(false);
     const uint32_t candidates[] = { GPS_BAUD, 115200, 38400 };
     char line[100];
+    for (int attempt = 0; attempt < 2; attempt++)
     for (uint32_t b : candidates) {
         SerialGPS.end();
         delay(20);
@@ -1432,7 +1476,7 @@ void LedTask(void* pv) {
             led_detect_active = false;
             bool export_on = (export_mode_active || export_connecting);
             bool show_led = !stealth_mode && !night_mode &&
-                            (export_on || (led_breathing_on && brightness_level >= 2 && !low_power_mode));
+                            (export_on || (led_breathing_on && brightness_level >= 3 && !low_power_mode));
             if (show_led) {
                 float breath = anim_pulse(export_on ? UI_PULSE_MEDIUM : UI_PULSE_BREATHE);
                 float dim    = export_on ? (0.30f + breath * 0.55f) : (0.15f + breath * 0.35f);
@@ -1464,6 +1508,11 @@ static int32_t current_load_sag_mv = 0;
 const int32_t SAG_WIFI_PROMISC = 45; // Estimated mV drop for continuous Wi-Fi Rx
 const int32_t SAG_BLE_SCAN = 35;     // Estimated mV drop for active BLE scanning
 const int32_t SAG_SPEAKER = 80;      // Estimated mV drop during active PCM audio playback
+
+// Session baseline for the Stats "V CHANGE" card: filtered voltage captured
+// once in setup() after the charge gate. The card shows cumulative drift
+// since boot, the same honest cumulative readout Charge Mode uses (+NmV).
+static int32_t session_start_mv = 0;
 
 int32_t get_filtered_voltage() {
     static uint32_t last_adc_ms = 0;
@@ -1585,15 +1634,34 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
     // boost rail (GPIO 38 PWM) and only lights at full brightness, which would
     // make it the single biggest load — useless for charging.
     lcd.wakeup();
-    // Brightness 5: matches bmorcelli/Launcher chargeMode(), which charges this
-    // exact hardware reliably at this level. Charge SLOPE was never backlight-
-    // limited (measured flat at 60..33), but on a critically low cell the rail
-    // margin is — every mA of steady load counts toward the halt threshold.
-    lcd.setBrightness(5);   // match bmorcelli/Launcher chargeMode(); lower steady load on a marginal rail
+    // Brightness 20 (~8% duty): user-chosen floor. setBrightness here is 0..255
+    // duty — do NOT port raw values from other firmware (Launcher's chargeMode
+    // "5" is a different scale; 5/255 is below this panel's visible threshold
+    // and the screen reads as completely dark). Charge slope was flat at
+    // 60..33, so anything at or below 30 is charge-neutral; 20 trades a dimmer
+    // readout for a little more rail margin.
+    lcd.setBrightness(20);
 
     // Cut the other begin()-powered loads not needed to charge.
     set_cardputer_led(0, 0, 0);              // LED off (its rail is down with the screen anyway)
     M5Cardputer.Speaker.end();               // power down the I2S amp (setVolume(0) only mutes)
+    // end() releases the I2S pins to floating inputs; a floating data/clock
+    // line lets the amp input chatter (heard as rapid faint clicking). Pin
+    // them low — the app's Speaker.begin() after resume reclaims them.
+    {
+        auto sc = M5Cardputer.Speaker.config();
+        if (sc.pin_data_out >= 0) { pinMode(sc.pin_data_out, OUTPUT); digitalWrite(sc.pin_data_out, LOW); }
+        if (sc.pin_bck      >= 0) { pinMode(sc.pin_bck,      OUTPUT); digitalWrite(sc.pin_bck,      LOW); }
+        if (sc.pin_ws       >= 0) { pinMode(sc.pin_ws,       OUTPUT); digitalWrite(sc.pin_ws,       LOW); }
+    }
+
+    // GPS receiver to standby for the whole charge. It is rail-powered even
+    // here (no hardware cutoff) and free-runs satellite acquisition at
+    // ~25-40mA — nearly half the ~60mA charge budget, and the reason a lit
+    // screen previously couldn't gain. With it asleep the readout can stay
+    // on the whole time (matching bmorcelli/Launcher, which has no GPS load).
+    // The boot-side probe wakes it again on every path back to the app.
+    gps_blind_cmd(true);
 
     // ── Always-on charging readout ───────────────────────────────────────────
     // The readout stays on screen the whole time; pressing any key starts the
@@ -1652,6 +1720,10 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
     bool     ui_safe      = (mv >= resume_mv);  // accent state (hysteresis below)
     bool     chrome_stale = true;               // full repaint on entry / safe flip
     int32_t  drawn_mv     = -1;                 // mv the value strips show (-1 = stale)
+    int      shown_pct    = -1;                 // ripple-guarded hero percent (-1 = unset)
+    int32_t  last_raw     = -1;                 // I2C wedge detector (see sample block)
+    int      flat_raws    = 0;
+    int      gps_renap    = 0;                  // re-issue GPS standby (see sample block)
 
     // Every dynamic element renders into its own small sprite and lands as ONE
     // blit, so the panel never shows a cleared-but-not-yet-redrawn state (the
@@ -1678,12 +1750,13 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
         bool pressed = M5Cardputer.Keyboard.isPressed();
         if (!pressed) { key_armed = true; press_frames = 0; }
         else if (key_armed && ++press_frames >= 2) {
-            // Real keypress (held >= 2 frames / ~60ms) -> start the app.
-            // Do NOT touch brightness here: charge mode holds one fixed level
-            // and the app's boot owns brightness afterward. Wait for release so
+            // Real keypress (held >= 2 frames / ~60ms). Wait for release so
             // the keystroke (e.g. 'b') can't leak into the app's keyboard
             // handler and cycle brightness the instant we return.
             while (M5Cardputer.Keyboard.isPressed()) { M5Cardputer.update(); delay(10); }
+            // Do NOT touch brightness here: charge mode holds one fixed level
+            // and the app's boot owns brightness afterward (the boot probe
+            // also wakes the GPS on this path).
             esp_task_wdt_delete(NULL);
             return;
         }
@@ -1692,7 +1765,36 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
         if (now - last_sample_ms >= SAMPLE_MS) {
             last_sample_ms = now;
             int32_t raw = charge_mode_read_mv();
-            ema_mv = 0.2f * (float)raw + 0.8f * ema_mv;
+
+            // I2C wedge detector. On the ADV the keyboard AND the PMIC battery
+            // reads share one I2C bus; a bus lockup (glitch mid-transaction)
+            // leaves this loop alive — petting the task WDT — but deaf (keys
+            // dead) and blind (reading frozen). That is the "frozen charge
+            // screen" no watchdog catches. A healthy 16-sample ADC mean always
+            // wobbles within a few minutes; a bit-identical raw for 180
+            // consecutive 1s samples, or a nonsense (<=100mV) read, means the
+            // bus is stuck. Reboot: full re-init clears the bus and the boot
+            // gate drops straight back into Charge Mode.
+            // Re-issue GPS standby every ~50s: the $PCAS12 window unit is
+            // ambiguous across CASIC firmwares (ms vs s); if it auto-wakes,
+            // this puts it back to sleep before it burns meaningful charge.
+            if (++gps_renap >= 50) { gps_renap = 0; gps_blind_cmd(true); }
+
+            if      (raw <= 100)      flat_raws += 30;   // garbage read: fail fast
+            else if (raw == last_raw) flat_raws++;
+            else                      flat_raws = 0;
+            last_raw = raw;
+            if (flat_raws >= 180) {
+                Serial.println("[CHARGE] peripheral wedge suspected (flat reads) -> reboot");
+                delay(50);
+                esp_restart();
+            }
+
+            // 0.08 (~12s TC at 1s samples, was 0.2/~5s): observed ±15mV ripple
+            // wobbled the readout enough to read as discharge. The resume
+            // decision already demands a 4s hold, so the slower filter only
+            // delays exit by seconds.
+            ema_mv = 0.08f * (float)raw + 0.92f * ema_mv;
             int32_t new_mv = (int32_t)ema_mv;
             mv = new_mv;
 
@@ -1740,6 +1842,12 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
         if (ui_safe) { if (mv <  resume_mv - 15) { ui_safe = false; chrome_stale = true; } }
         else         { if (mv >= resume_mv)      { ui_safe = true;  chrome_stale = true; } }
         int      pct    = voltage_to_percent(mv);
+        // Ripple guard: ADC ripple (±15mV) flaps the mapped percent at curve
+        // boundaries — worst at the bottom, where the hero bounces 1 <-> 0 and
+        // reads as "losing charge" while actually charging. Percent rises
+        // freely but only falls on a real >=2-point drop.
+        if (shown_pct < 0 || pct > shown_pct || shown_pct - pct >= 2) shown_pct = pct;
+        pct = shown_pct;
         uint16_t accent = ui_safe ? COL_GOOD : COL_LOW;
 
         if (chrome_stale) {
@@ -1754,7 +1862,7 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
             lcd.setTextSize(1);
             {
                 int tx = PAD;
-                for (const char* p = "CHARGING MODE"; *p; p++) {
+                for (const char* p = "CHARGE MODE"; *p; p++) {
                     char ch[2] = {*p, '\0'};
                     lcd.drawString(ch, tx, PAD);
                     tx += 6 + 2;
@@ -1838,10 +1946,12 @@ void run_charge_mode(bool user_requested, bool after_brownout) {
         //   - Bolt pulse: breathes from near-off to full accent over 1.6s.
         // Proof-of-life: the voltage EMA can sit unchanged for minutes on the
         // flat of the LiPo curve; without motion the screen reads as frozen.
-        // 3s step interval (was 50ms): each blit is a transient load spike on a
-        // marginal rail; ~60x fewer of them, like the Launcher's ~5s redraw.
-        // The bolt/gauge step coarsely instead of breathing — still proof-of-life.
-        if (spr_ok && now - last_anim_ms >= 3000) {
+        // Step interval scales with rail health: on a marginal cell every blit
+        // is a transient load spike, so step coarsely (3s, like the Launcher's
+        // ~5s redraw); on a healthy cell (>=3450mV) step at 1s so the screen
+        // visibly lives — at 3s + heavy EMA it reads as frozen.
+        uint32_t anim_iv = (mv >= 3450) ? 1000 : 3000;
+        if (spr_ok && now - last_anim_ms >= anim_iv) {
             last_anim_ms = now;
             const uint32_t CYCLE_MS = 1600;
             uint32_t ph = now % CYCLE_MS;
@@ -3715,7 +3825,7 @@ void load_session_from_flash() {
             if (parsed >= 1) next_detection_id = parsed;
         }
         else if (key == "night")      night_mode = (val.toInt() != 0);
-        else if (key == "brightness") { int b = val.toInt(); if (b >= 0 && b <= 2) brightness_level = b; }
+        else if (key == "brightness") { int b = val.toInt(); if (b >= 0 && b <= 3) brightness_level = b; }
         else if (key == "low_power")  low_power_mode = (val.toInt() != 0);
         else if (key == "stealth")    stealth_mode = (val.toInt() != 0);
         else if (key == "muted")      is_muted = (val.toInt() != 0);
@@ -6622,6 +6732,7 @@ static void set_turbo_mode(bool on) {
         if (low_power_mode) {
             low_power_mode = false;
             apply_ble_scan_params();
+            gps_standby(false);   // turbo cancels low power: wake the GPS too
             // Low-power dimmed the backlight; turbo means full performance, so
             // bring it back up (unless stealth/ambient own it).
             if (!stealth_mode && !ambient_mode)
@@ -6683,6 +6794,7 @@ void handle_menu_select() {
             if (!stealth_mode && !ambient_mode)
                 M5Cardputer.Display.setBrightness(effective_brightness());
             apply_ble_scan_params();
+            gps_standby(low_power_mode);   // GPS receiver to standby / wake
             schedule_persist();
             screen_dirty = true;
             break;
@@ -9475,7 +9587,8 @@ void draw_gps_screen() {
         const char* status_base;
         uint16_t    status_col;
         bool        status_anim = false;
-        if      (has_loc && !stale) { status_base = "GPS LOCKED";    status_col = GPS_COLOR; }
+        if      (low_power_mode)    { status_base = "DISABLED";      status_col = DIM_COLOR; }  // receiver in standby
+        else if (has_loc && !stale) { status_base = "GPS LOCKED";    status_col = GPS_COLOR; }
         else if (stale)             { status_base = "REATTEMPTING";  status_col = CAUTION_COLOR; status_anim = true; }
         else                        { status_base = "Searching";     status_col = GPS_COLOR; status_anim = true; }
         char status_str[22];
@@ -9692,7 +9805,10 @@ void draw_device_info_screen() {
     char sess_str[10];  format_time_buf(sess_s, sess_str, sizeof(sess_str));
     char life_str[10];  format_time_buf(l_sec, life_str, sizeof(life_str));
     int bat_pct = voltage_to_percent(bat_mv);
-    bool charging = M5Cardputer.Power.isCharging();
+    // isCharging() returns 2 (unknown) on this hardware — no charge-status
+    // line — so only a definite 1 may show the "+" (see get_filtered_voltage).
+    // Truthy-testing it painted a permanent "+" next to a falling percent.
+    bool charging = (M5Cardputer.Power.isCharging() == 1);
     char volt_str[10];
     if (charging) {
         snprintf(volt_str, sizeof(volt_str), "%d%%+", bat_pct);
@@ -9710,6 +9826,15 @@ void draw_device_info_screen() {
     char boots_str[10];   snprintf(boots_str,   sizeof(boots_str),   "%ld",   lb);
     char flash_str[10];   snprintf(flash_str,   sizeof(flash_str),   "%ld",   lfw);
     char voltage_str[10]; snprintf(voltage_str, sizeof(voltage_str), "%.2fV", bat_mv / 1000.0f);
+    // V CHANGE: cumulative drift since boot (negative = net loss). Falls back
+    // to mV until the magnitude crosses a volt, which never fits the cell's
+    // real range anyway.
+    char vdelta_str[10];
+    int32_t dv = (session_start_mv > 0) ? (bat_mv - session_start_mv) : 0;
+    if (dv <= -1000 || dv >= 1000)
+        snprintf(vdelta_str, sizeof(vdelta_str), "%+.2fV", dv / 1000.0f);
+    else
+        snprintf(vdelta_str, sizeof(vdelta_str), "%+dmV", (int)dv);
 
     // First-frame seed for per-character roll animation. Copy the freshly
     // formatted strings into stats_prev_strings without stamping any
@@ -9733,6 +9858,7 @@ void draw_device_info_screen() {
         seed[SC_FLASH]      = flash_str;
         seed[SC_VERSION]    = VERSION_SHORT;
         seed[SC_VOLTAGE]    = voltage_str;
+        seed[SC_VDELTA]     = vdelta_str;
         for (int i = 0; i < STATS_CARD_COUNT; i++) {
             strncpy(stats_prev_strings[i], seed[i], STAT_MAX_CHARS - 1);
             stats_prev_strings[i][STAT_MAX_CHARS - 1] = '\0';
@@ -9818,6 +9944,9 @@ void draw_device_info_screen() {
     // Row 7 (vy = 252): VERSION | VOLTAGE
     card(x_h1, 252, w_half, H_NORMAL, "VERSION", VERSION_SHORT, SC_VERSION);
     card(x_h2, 252, w_half, H_NORMAL, "VOLTAGE", voltage_str,   SC_VOLTAGE);
+
+    // Row 8 (vy = 294): V CHANGE — cumulative voltage drift since boot
+    card(x_full, 294, w_full, H_NORMAL, "V CHANGE", vdelta_str, SC_VDELTA);
 
     spr.clearClipRect();
 
@@ -10603,8 +10732,9 @@ void setup() {
 
     M5Cardputer.Speaker.setVolume(0);
     M5Cardputer.Display.setRotation(1);
-    brightness_level = 2;
+    brightness_level = 3;
     apply_color_palette();
+    session_start_mv = get_filtered_voltage();   // V CHANGE card baseline
 
     // Ease the screen in: brightness ramps from 0 → target over UI_ANIM_NORMAL
     // while the title intro animation runs simultaneously. Reads as a "wakeup"
@@ -10917,6 +11047,10 @@ void setup() {
     // are up so RMT/radio contention is avoided.
     xTaskCreatePinnedToCore(LedTask, "LedTask", 1536, NULL, 1, &LedTaskHandle, 1);
 
+    // Persisted low power: put the GPS receiver into standby now that its
+    // UART is up (the toggle sites handle the live transitions).
+    if (low_power_mode) gps_standby(true);
+
     // WDT was already initialized early in setup(); each watched task
     // self-subscribes via esp_task_wdt_add(NULL) inside its loop.
 
@@ -11143,6 +11277,7 @@ static void service_battery_warnings(int32_t loop_mv) {
             if (!stealth_mode && !ambient_mode)
                 M5Cardputer.Display.setBrightness(effective_brightness());
             apply_ble_scan_params();      // applies 50%-duty BLE params
+            gps_standby(true);            // GPS to standby: biggest cuttable load
             schedule_persist();           // flush state now in case of imminent cutoff
             set_toast_direct("LOW BATT - CONSERVING", TOAST_WARNING, false);
         }
@@ -12093,13 +12228,23 @@ static void handle_keyboard_input() {
             }
             else if (c == 'b') {
                 if (!stealth_mode) {
-                    brightness_level = (brightness_level + 1) % 3;
+                    brightness_level = (brightness_level + 1) % 4;
                     M5Cardputer.Display.setBrightness(effective_brightness());
                     // Disable LED at dim levels, re-enable at full brightness
-                    if (brightness_level < 2) {
+                    if (brightness_level < 3) {
                         led_breathing_on = false;
                     } else {
                         led_breathing_on = true;
+                    }
+                    // On-screen feedback — and the reason nothing visibly
+                    // changes in low power, which pins the backlight to the
+                    // ambient dim regardless of the selected level.
+                    if (low_power_mode) {
+                        set_toast_direct("LOW POWER LOCKS DIM", TOAST_WARNING);
+                    } else {
+                        char bmsg[16];
+                        snprintf(bmsg, sizeof(bmsg), "BRIGHTNESS %d/4", brightness_level + 1);
+                        set_toast_direct(bmsg, TOAST_NEUTRAL);
                     }
                     schedule_persist();
                 }
